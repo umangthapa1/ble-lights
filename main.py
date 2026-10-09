@@ -27,6 +27,8 @@ from typing import Any, Callable
 import speech_recognition as sr
 from bleak import BleakClient, BleakScanner
 
+from speech_feedback import DEFAULT_FEEDBACK_VOLUME, FeedbackFilteredStream, PlaybackGate, SpokenFeedback
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
@@ -200,6 +202,8 @@ class CommandResult:
     changed: bool
     summary: str
     should_exit: bool = False
+    spoken: str | None = None
+    category: str = "command"
 
 
 class Console:
@@ -264,6 +268,7 @@ class Console:
             "listening": ("●", "LISTENING", self.GREEN),
             "captured": ("◉", "CAPTURED", self.YELLOW),
             "offline": ("●", "LISTENING", self.YELLOW),
+            "paused": ("○", "PAUSED", self.YELLOW),
         }
         icon, label, color = states.get(phase, states["listening"])
         self.write(
@@ -349,6 +354,61 @@ def duration_label(seconds: float) -> str:
     hours, remainder = divmod(seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
+
+
+def spoken_duration(seconds: float) -> str:
+    hours, remainder = divmod(max(1, math.ceil(seconds)), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    parts = [f"{value} {unit}{'s' if value != 1 else ''}"
+             for value, unit in ((hours, "hour"), (minutes, "minute"), (seconds, "second")) if value]
+    return " and ".join(parts)
+
+
+def spoken_light_state(state: dict[str, Any]) -> str:
+    if not state["on"]:
+        return "Lights off."
+    mode = state.get("effect") or state.get("mode")
+    setting = f"{mode.capitalize()} mode enabled." if mode else f"{light_color_label(state).capitalize()} lights on."
+    return f"{setting} Brightness {round(state['brightness'] * 100)} percent."
+
+
+def feedback_command(text: str, state: dict[str, Any]) -> CommandResult | None:
+    """Handle speech settings outside lighting history and percentage parsing."""
+
+    mode_commands = {
+        "enable spoken feedback": "all", "enable feedback": "all", "unmute feedback": "all",
+        "only announce alarms": "alarms", "feedback alarms only": "alarms",
+        "mute feedback": "off", "disable spoken feedback": "off", "disable feedback": "off",
+    }
+    if text in mode_commands:
+        mode = mode_commands[text]
+        state["feedback_mode"] = mode
+        state.setdefault("feedback_volume", DEFAULT_FEEDBACK_VOLUME)
+        summary = {"all": "Spoken feedback enabled.", "alarms": "Only announcing alarms.", "off": "Spoken feedback muted."}[mode]
+        return CommandResult(True, summary, spoken=summary if mode != "off" else None, category="feedback")
+
+    if text == "feedback status":
+        mode = state.get("feedback_mode", "off")
+        volume = state.get("feedback_volume", DEFAULT_FEEDBACK_VOLUME)
+        return CommandResult(False, f"Spoken feedback: {mode}, volume {volume}%.", category="feedback")
+
+    volume_match = re.fullmatch(r"(?:set )?feedback volume(?: to)? (.+)", text)
+    if volume_match:
+        tokens = re.findall(r"[a-z]+|-?\d+(?:\.\d+)?|%", volume_match[1])
+        amount = read_percentage(tokens, 0)
+        if amount:
+            value, end = amount
+            suffix = tokens[end:]
+            if 0 <= value <= 100 and (not suffix or suffix in (["%"], ["percent"])):
+                volume = round(value)
+                state["feedback_volume"] = volume
+                summary = f"Feedback volume set to {volume} percent."
+                return CommandResult(True, summary, spoken=summary if volume else None, category="feedback")
+        return CommandResult(False, "Use 'feedback volume 0' through 'feedback volume 100'.", category="feedback")
+
+    if re.search(r"\bfeedback\b", text) or text.startswith("only announce"):
+        return CommandResult(False, "Try 'enable spoken feedback', 'feedback volume 30', 'only announce alarms', or 'mute feedback'.", category="feedback")
+    return None
 
 
 def timer_label(state: dict[str, Any], now: float | None = None) -> str:
@@ -529,7 +589,8 @@ def schedule_alarm(text: str, state: dict[str, Any]) -> CommandResult | None:
         "active": False,
         "label": "visual alarm",
     }
-    return CommandResult(True, f"Alarm set for {duration_label(duration)} from now.")
+    return CommandResult(True, f"Alarm set for {duration_label(duration)} from now.",
+                         spoken=f"Alarm set for {spoken_duration(duration)}.", category="alarm")
 
 
 def snooze_alarm(text: str, state: dict[str, Any]) -> CommandResult | None:
@@ -547,7 +608,8 @@ def snooze_alarm(text: str, state: dict[str, Any]) -> CommandResult | None:
         return CommandResult(False, "Use a snooze duration, e.g. 'snooze for 5 minutes'.")
 
     alarm.update(deadline=time.monotonic() + duration, active=False, snoozed=True)
-    return CommandResult(True, f"Alarm snoozed for {duration_label(duration)}.")
+    return CommandResult(True, f"Alarm snoozed for {duration_label(duration)}.",
+                         spoken=f"Alarm snoozed for {spoken_duration(duration)}.", category="alarm")
 
 
 def read_percentage(tokens: list[str], start: int) -> tuple[float, int] | None:
@@ -701,7 +763,7 @@ def schedule_timer(text: str, state: dict[str, Any]) -> CommandResult | None:
         summary = f"{command} started. {summary}"
     if replacing:
         summary += " Replaced the previous timer."
-    return CommandResult(True, summary)
+    return CommandResult(True, summary, spoken=f"Timer set for {spoken_duration(duration)}.")
 
 
 def normalize_command(text: str) -> str:
@@ -720,6 +782,9 @@ def apply_command(text: str, state: dict[str, Any]) -> CommandResult:
     """Apply a command with bounded undo history and repeat support."""
 
     command = normalize_command(text)
+    feedback_result = feedback_command(command, state)
+    if feedback_result is not None:
+        return feedback_result
     if command in {"undo", "undo last command", "restore", "restore previous setting", "restore previous settings"}:
         history = state.get("_history", [])
         if not history:
@@ -733,7 +798,7 @@ def apply_command(text: str, state: dict[str, Any]) -> CommandResult:
         timer = state.get("timer")
         if timer and timer["deadline"] <= time.monotonic():
             state["timer"] = None
-        return CommandResult(True, "Previous setting restored.")
+        return CommandResult(True, "Previous setting restored.", spoken="Previous setting restored.")
 
     repeated = command in {"repeat", "repeat last command", "repeat the last command", "again"}
     if repeated:
@@ -762,6 +827,9 @@ def _apply_command(text: str, state: dict[str, Any], *, allow_timer: bool = True
     if not raw:
         return CommandResult(False, "I didn't receive a command.")
 
+    if re.search(r"\bfeedback\b", normalized) or normalized.startswith("only announce"):
+        return CommandResult(False, "Use feedback controls directly; they cannot be scheduled.")
+
     if normalized in {"quit", "exit", "stop", "goodbye", "shutdown"}:
         return CommandResult(False, "Shutting down gracefully.", should_exit=True)
 
@@ -772,7 +840,8 @@ def _apply_command(text: str, state: dict[str, Any], *, allow_timer: bool = True
             "jungle mode, ocean mode, fireplace mode, toggle, brightness 10, "
             "breathing blue, undo, restore previous setting, repeat last command, "
             "sleep in 30 minutes, turn off in 1 hour, or dim to 10% in 20 minutes. "
-            "Type 'modes', 'effects', or 'timer status' for details.",
+            "Enable spoken feedback, feedback volume 30, only announce alarms, mute feedback. "
+            "Type 'modes', 'effects', 'timer status', or 'feedback status' for details.",
         )
 
     if normalized in {"modes", "scenes", "list modes", "list scenes"}:
@@ -796,7 +865,8 @@ def _apply_command(text: str, state: dict[str, Any], *, allow_timer: bool = True
             return CommandResult(False, "No alarm is active.")
         was_active = state["alarm"].get("active", False)
         state["alarm"] = None
-        return CommandResult(True, "Alarm dismissed." if was_active else "Alarm cancelled.")
+        summary = "Alarm dismissed." if was_active else "Alarm cancelled."
+        return CommandResult(True, summary, spoken=summary, category="alarm")
 
     if allow_timer:
         snoozed = snooze_alarm(normalized, state)
@@ -810,12 +880,13 @@ def _apply_command(text: str, state: dict[str, Any], *, allow_timer: bool = True
 
     if normalized in {"stop effect", "stop effects", "static mode", "solid mode", "stop animation"}:
         state.update(effect=None, effect_color=None, color_name=color_name_for(state["color"]))
-        return CommandResult(True, "Animated effect stopped; returning to the last solid color.")
+        return CommandResult(True, "Animated effect stopped; returning to the last solid color.", spoken="Effect stopped.")
 
     if normalized in {"cancel timer", "clear timer", "stop timer", "cancel the timer"}:
         had_timer = state.get("timer") is not None
         state["timer"] = None
-        return CommandResult(had_timer, "Timer cancelled." if had_timer else "No timer was active.")
+        return CommandResult(had_timer, "Timer cancelled." if had_timer else "No timer was active.",
+                             spoken="Timer cancelled." if had_timer else None)
 
     if normalized in {"timer", "timer status", "time remaining"}:
         return CommandResult(False, timer_label(state) or "No timer is active.")
@@ -838,6 +909,7 @@ def _apply_command(text: str, state: dict[str, Any], *, allow_timer: bool = True
             f"at {round(state['brightness'] * 100)}%"
             + (f", {scene_text}." if scene_text else ".")
             + (f" {timer}." if timer else ""),
+            spoken=spoken_light_state(state),
         )
 
     tokens = re.findall(r"[a-z]+|-?\d+(?:\.\d+)?|%", normalized)
@@ -933,7 +1005,7 @@ def _apply_command(text: str, state: dict[str, Any], *, allow_timer: bool = True
         state["color_name"] = color_name_for(state["color"])
     power = "on" if state["on"] else "off"
     summary = f"{', '.join(dict.fromkeys(recognized))} → {power}, {light_color_label(state)} at {round(state['brightness'] * 100)}%"
-    return CommandResult(True, summary)
+    return CommandResult(True, summary, spoken=spoken_light_state(state))
 
 
 def microphone_names() -> list[str]:
@@ -1133,6 +1205,7 @@ def post_event(loop: asyncio.AbstractEventLoop, event_queue: asyncio.Queue, even
 def start_listening(
     loop: asyncio.AbstractEventLoop,
     event_queue: asyncio.Queue,
+    playback_gate: PlaybackGate | None = None,
 ) -> Callable[..., Any] | None:
     """Start background microphone recognition, returning its stop callback.
 
@@ -1180,7 +1253,7 @@ def start_listening(
     threshold_detail = f"Listening threshold: {recognizer.energy_threshold:.0f} (calibrated from {calibrated_threshold:.0f})"
     post_event(loop, event_queue, {"kind": "status", "level": "info", "message": threshold_detail})
 
-    def on_audio(recognizer_instance: sr.Recognizer, audio: sr.AudioData) -> None:
+    def on_audio(recognizer_instance: sr.Recognizer, audio: sr.AudioData, capture_token: int | None) -> None:
         try:
             cleaned_audio, raw_level, cleaned_level = prepare_audio_for_recognition(audio)
             level_detail = f"Audio captured (level {raw_level} → normalized {cleaned_level}) — transcribing your input…"
@@ -1234,9 +1307,14 @@ def start_listening(
             post_event(loop, event_queue, {"kind": "mic", "phase": "listening", "message": "Listening again…"})
             return
 
+        if playback_gate and not playback_gate.accepts(capture_token):
+            return
         text = (text or "").strip()
         if text:
-            post_event(loop, event_queue, {"kind": "command", "source": "voice", "provider": provider, "text": text})
+            post_event(loop, event_queue, {
+                "kind": "command", "source": "voice", "provider": provider,
+                "text": text, "capture_token": capture_token,
+            })
         else:
             post_event(loop, event_queue, {"kind": "mic", "phase": "listening", "message": "No words recognized — listening again…"})
 
@@ -1251,6 +1329,8 @@ def start_listening(
             # listen_in_background's hidden thread) lets us report success only
             # after the microphone is genuinely open and ready to read.
             with mic as source:
+                if playback_gate:
+                    source.stream = FeedbackFilteredStream(source.stream, playback_gate)
                 stream_ready.set()
                 post_event(
                     loop,
@@ -1259,7 +1339,16 @@ def start_listening(
                 )
                 post_event(loop, event_queue, {"kind": "mic", "phase": "listening", "message": "Waiting for your voice…"})
                 idle_windows = 0
+                was_paused = False
                 while running.is_set():
+                    capture_token = playback_gate.token() if playback_gate else None
+                    paused = playback_gate is not None and capture_token is None
+                    if paused != was_paused:
+                        post_event(loop, event_queue, {
+                            "kind": "mic", "phase": "paused" if paused else "listening",
+                            "message": "Spoken feedback playing…" if paused else "Waiting for your voice…",
+                        })
+                        was_paused = paused
                     try:
                         audio = recognizer.listen(
                             source,
@@ -1267,6 +1356,8 @@ def start_listening(
                             phrase_time_limit=max(1.0, MIC_PHRASE_LIMIT),
                         )
                     except sr.WaitTimeoutError:
+                        if playback_gate and playback_gate.token() is None:
+                            continue
                         idle_windows += 1
                         if idle_windows % 10 == 0:
                             post_event(
@@ -1276,8 +1367,8 @@ def start_listening(
                             )
                         continue
                     idle_windows = 0
-                    if running.is_set():
-                        on_audio(recognizer, audio)
+                    if running.is_set() and (not playback_gate or playback_gate.accepts(capture_token)):
+                        on_audio(recognizer, audio, capture_token)
         except Exception as exc:
             startup_error.append(str(exc))
             stream_ready.set()
@@ -1394,12 +1485,16 @@ async def event_worker(
     state: dict[str, Any],
     shutdown: asyncio.Event,
     console: Console,
+    feedback: SpokenFeedback | None = None,
 ) -> None:
     while not shutdown.is_set():
         event = await event_queue.get()
         kind = event.get("kind") if isinstance(event, dict) else "command"
         if kind == "mic":
-            console.mic_indicator(event.get("phase", "listening"), event.get("message", "Waiting for your voice…"))
+            if feedback and feedback.gate.token() is None and event.get("phase") == "listening":
+                console.mic_indicator("paused", "Spoken feedback playing…")
+            else:
+                console.mic_indicator(event.get("phase", "listening"), event.get("message", "Waiting for your voice…"))
             continue
         if kind == "status":
             console.status(event["message"], event.get("level", "info"))
@@ -1409,6 +1504,9 @@ async def event_worker(
             continue
         text = event.get("text", "") if isinstance(event, dict) else str(event)
         source = event.get("source", "voice") if isinstance(event, dict) else "voice"
+        if feedback and source == "voice" and isinstance(event, dict) and "capture_token" in event:
+            if not feedback.gate.accepts(event["capture_token"]):
+                continue
         console.heard(text, source)
         result = apply_command(text, state)
         if result.should_exit:
@@ -1416,8 +1514,12 @@ async def event_worker(
             shutdown.set()
             continue
         console.light_state(state, result.summary)
+        if feedback:
+            if result.category == "feedback" and result.changed:
+                feedback.settings_changed()
+            feedback.say(result.spoken, result.category)
         if source == "voice":
-            provider = event.get("provider", "online")
+            provider = event.get("provider", "online") if isinstance(event, dict) else "online"
             console.status(f"Recognized via {provider} speech input.", "success")
             console.mic_indicator("listening", "Waiting for your next command…")
 
@@ -1426,16 +1528,21 @@ async def timer_worker(
     state: dict[str, Any],
     shutdown: asyncio.Event,
     console: Console,
+    feedback: SpokenFeedback | None = None,
 ) -> None:
     while not shutdown.is_set():
         message = apply_due_timer(state)
         if message:
             console.status(message, "success")
             console.light_state(state, "Timer action applied")
+            if feedback:
+                feedback.say(f"Timer finished. {spoken_light_state(state)}", "timer")
         alarm_message = apply_due_alarm(state)
         if alarm_message:
             console.status(alarm_message, "warning")
             console.light_state(state, "Visual alarm active")
+            if feedback:
+                feedback.say("Your alarm is ringing. Say acknowledge alarm or snooze.", "alarm")
         try:
             await asyncio.wait_for(shutdown.wait(), timeout=0.25)
         except asyncio.TimeoutError:
@@ -1469,6 +1576,8 @@ async def run() -> None:
         "effect_color": None,
         "timer": None,
         "alarm": None,
+        "feedback_mode": "off",
+        "feedback_volume": DEFAULT_FEEDBACK_VOLUME,
     }
     console.light_state(state, "Starting up")
 
@@ -1481,8 +1590,10 @@ async def run() -> None:
             pass
 
     event_queue: asyncio.Queue = asyncio.Queue()
-    worker = asyncio.create_task(event_worker(event_queue, state, shutdown, console))
-    timer_task = asyncio.create_task(timer_worker(state, shutdown, console))
+    feedback = SpokenFeedback(state, console.status)
+    feedback.start()
+    worker = asyncio.create_task(event_worker(event_queue, state, shutdown, console, feedback))
+    timer_task = asyncio.create_task(timer_worker(state, shutdown, console, feedback))
     mic_stop: Callable[..., Any] | None = None
     keyboard_stop: Callable[[], None] | None = None
     current: list[float] = [0.0, 0.0, 0.0]
@@ -1491,7 +1602,7 @@ async def run() -> None:
     try:
         # Run PortAudio calibration away from the asyncio loop so status events
         # and Bluetooth work stay responsive while the mic is being prepared.
-        mic_stop = await asyncio.to_thread(start_listening, loop, event_queue)
+        mic_stop = await asyncio.to_thread(start_listening, loop, event_queue, feedback.gate)
         keyboard_stop = start_keyboard_input(loop, event_queue)
         console.prompt_help(mic_stop is not None)
 
@@ -1551,6 +1662,7 @@ async def run() -> None:
         worker.cancel()
         timer_task.cancel()
         await asyncio.gather(worker, timer_task, return_exceptions=True)
+        await feedback.close()
         console.status("Lumen signed off. Goodbye.", "success")
 
 

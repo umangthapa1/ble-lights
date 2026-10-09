@@ -269,6 +269,41 @@ The alarm indicator appears beside the light state. While it is active, the
 alarm pattern takes priority over scenes and effects. Acknowledge or dismiss it
 to restore the previous light state.
 
+## Spoken feedback
+
+Install `espeak-ng` first (CachyOS/Arch: `sudo pacman -S espeak-ng`;
+Debian/Ubuntu: `sudo apt install espeak-ng`). Speech output is offline. See the
+[README setup instructions](README.md#spoken-feedback-optional).
+
+| Command | What it does |
+| --- | --- |
+| `enable spoken feedback` | Speak short light, timer, and alarm confirmations |
+| `enable feedback`, `unmute feedback` | Aliases for enabling all confirmations |
+| `feedback volume 30` | Set speech volume to 30%; accepts values 0–100 |
+| `set feedback volume to thirty percent` | Spoken-number form of the volume command |
+| `only announce alarms` | Speak only alarm updates and announcements |
+| `feedback alarms only` | Alias for alarms-only feedback |
+| `mute feedback` | Stop playing/queued speech and disable announcements |
+| `disable spoken feedback`, `disable feedback` | Aliases for mute |
+| `feedback status` | Show the speech mode and volume in the terminal |
+
+Examples of spoken confirmations:
+
+- `ocean mode` → “Ocean mode enabled. Brightness 100 percent.” (at full brightness)
+- `alarm in ten minutes` → “Alarm set for 10 minutes.”
+- When the alarm fires → “Your alarm is ringing. Say acknowledge alarm or snooze.”
+
+Feedback starts muted at a configured volume of 70% on each launch. Setting
+volume does not enable feedback; volume 0 is silent. Alarms-only mode includes
+setting, snoozing, and dismissing alarms, plus one announcement at each alarm
+activation. It does not repeatedly speak over the visual alarm.
+
+The microphone ignores audio during Lumen's speech and a short echo cooldown;
+wait for the confirmation to finish before speaking again. You can type commands
+at any time. Speech settings are separate from the light's brightness and
+undo/repeat history. Feedback controls apply immediately and cannot be scheduled
+with a timer.
+
 ## History and repeat
 
 Lumen keeps up to 20 successful light changes in memory while it is running.

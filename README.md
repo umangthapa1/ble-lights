@@ -26,6 +26,8 @@ reference.
 - Timed actions such as `sleep in 30 minutes` and `turn off in 1 hour`.
 - Undo, repeat, restore, toggle, timer status, and natural power aliases.
 - Visual alarms with snooze, acknowledge, dismiss, and cancel controls.
+- Offline spoken confirmations with adjustable volume, alarms-only mode, and
+  microphone echo suppression.
 - Smooth fades instead of abrupt color changes.
 - Automatic Bluetooth scanning and reconnecting.
 - `--list-mics` plus `MIC_DEVICE` support for choosing the correct input.
@@ -62,6 +64,51 @@ PocketSphinx in the virtual environment:
 ```sh
 python -m pip install pocketsphinx
 ```
+
+## Spoken feedback (optional)
+
+Install **eSpeak NG** for offline speech output. On CachyOS/Arch:
+
+```sh
+sudo pacman -S espeak-ng
+```
+
+On Debian/Ubuntu: `sudo apt install espeak-ng`. Lumen uses `espeak-ng` from
+your PATH, or `espeak` if that is already installed. No additional Python
+package, API key, or internet connection is needed for speech output.
+
+Start Lumen and say or type:
+
+```text
+enable spoken feedback
+feedback volume 30
+ocean mode
+alarm in ten minutes
+only announce alarms
+mute feedback
+feedback status
+```
+
+You will hear short confirmations such as “Ocean mode enabled. Brightness
+100 percent.” and “Alarm set for 10 minutes.”
+
+- Feedback starts **muted**, with a volume setting of **70%**. These settings
+  last for the current session.
+- `feedback volume 0` silences output; values up to 100 adjust only Lumen's
+  speech volume, not light brightness or the system volume. Changing volume
+  does not enable a muted mode.
+- `only announce alarms` speaks alarm setup, snooze/dismissal, and a single
+  announcement when an alarm fires. Ordinary light/timer confirmations are
+  silent. The mode change itself is confirmed aloud.
+- `mute feedback` immediately cancels playing and queued speech. Visual alarms
+  and light controls continue to work.
+- Audio is spoken in the background. While Lumen talks (plus a short echo
+  cooldown), microphone commands are suppressed and captured audio is drained
+  so it cannot trigger its own commands. Speak after the confirmation ends;
+  keyboard commands remain available during playback.
+- If the speech engine is missing or fails, Lumen shows a terminal message and
+  keeps the light controller running. After installing the engine, use
+  `enable spoken feedback` again to retry.
 
 ## Choose a microphone
 
@@ -139,6 +186,7 @@ Try saying or typing:
 - `toggle`, `stop effect`, `cancel timer`
 - `undo`, `restore previous setting`, `repeat last command`, `timer status`
 - `alarm in 10 minutes`, `alarm status`, `snooze`, `acknowledge alarm`
+- `enable spoken feedback`, `feedback volume 30`, `only announce alarms`, `mute feedback`
 - `modes`, `effects`, `status`, `help`, `quit`
 
 ## Scene modes
