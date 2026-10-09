@@ -1,0 +1,2 @@
+bleak>=0.22,<2
+SpeechRecognition[audio]>=3.10.4,<4
