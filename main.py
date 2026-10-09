@@ -27,7 +27,7 @@ from typing import Any, Callable
 import speech_recognition as sr
 from bleak import BleakClient, BleakScanner
 
-from speech_feedback import DEFAULT_FEEDBACK_VOLUME, FeedbackFilteredStream, PlaybackGate, SpokenFeedback
+from speech_feedback import DEFAULT_FEEDBACK_VOLUME, FeedbackFilteredStream, PlaybackGate, PlaybackInterrupted, SpokenFeedback
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -364,12 +364,20 @@ def spoken_duration(seconds: float) -> str:
     return " and ".join(parts)
 
 
-def spoken_light_state(state: dict[str, Any]) -> str:
+def spoken_light_state(
+    state: dict[str, Any], *, include_setting: bool = True, include_brightness: bool = True,
+) -> str:
+    """Describe only the requested parts of the final light state."""
+
     if not state["on"]:
         return "Lights off."
-    mode = state.get("effect") or state.get("mode")
-    setting = f"{mode.capitalize()} mode enabled." if mode else f"{light_color_label(state).capitalize()} lights on."
-    return f"{setting} Brightness {round(state['brightness'] * 100)} percent."
+    parts = []
+    if include_setting:
+        mode = state.get("effect") or state.get("mode")
+        parts.append(f"{mode.capitalize()} mode enabled." if mode else f"{light_color_label(state).capitalize()} lights on.")
+    if include_brightness:
+        parts.append(f"Brightness {round(state['brightness'] * 100)} percent.")
+    return " ".join(parts) or "Lights on."
 
 
 def feedback_command(text: str, state: dict[str, Any]) -> CommandResult | None:
@@ -390,7 +398,10 @@ def feedback_command(text: str, state: dict[str, Any]) -> CommandResult | None:
     if text == "feedback status":
         mode = state.get("feedback_mode", "off")
         volume = state.get("feedback_volume", DEFAULT_FEEDBACK_VOLUME)
-        return CommandResult(False, f"Spoken feedback: {mode}, volume {volume}%.", category="feedback")
+        summary = f"Spoken feedback: {mode}, volume {volume}%."
+        if mode == "off":
+            summary += " Say or type 'enable spoken feedback' to hear confirmations."
+        return CommandResult(False, summary, category="feedback")
 
     volume_match = re.fullmatch(r"(?:set )?feedback volume(?: to)? (.+)", text)
     if volume_match:
@@ -914,6 +925,7 @@ def _apply_command(text: str, state: dict[str, Any], *, allow_timer: bool = True
 
     tokens = re.findall(r"[a-z]+|-?\d+(?:\.\d+)?|%", normalized)
     recognized: list[str] = []
+    spoken_fields: set[str] = set()
     effect_requested = any(token in EFFECTS or token in EFFECT_ALIASES for token in tokens)
     index = 0
     while index < len(tokens):
@@ -943,6 +955,7 @@ def _apply_command(text: str, state: dict[str, Any], *, allow_timer: bool = True
                 state["brightness"] = max(0.01, percentage / 100)
                 state["on"] = True
             recognized.append(f"brightness {round(percentage)}%")
+            spoken_fields.add("brightness")
             continue
 
         if token in EFFECTS or token in EFFECT_ALIASES:
@@ -951,11 +964,13 @@ def _apply_command(text: str, state: dict[str, Any], *, allow_timer: bool = True
             if effect == "thunder":
                 state["brightness"] = 1.0
             recognized.append(f"{effect} effect")
+            spoken_fields.add("setting")
         elif token in SCENES or token in SCENE_ALIASES:
             mode = SCENE_ALIASES.get(token, token)
             color_name, brightness = SCENES[mode]
             state.update(on=True, color=COLORS[color_name], color_name=color_name, brightness=brightness, mode=mode, effect=None, effect_color=None)
             recognized.append(f"{mode} mode")
+            spoken_fields.add("setting")
         elif token in COLORS or token in COLOR_ALIASES:
             name = COLOR_ALIASES.get(token, token)
             if state.get("effect") in {"breathing", "pulse"} and effect_requested:
@@ -970,6 +985,7 @@ def _apply_command(text: str, state: dict[str, Any], *, allow_timer: bool = True
                 state["effect"] = None
                 state["effect_color"] = None
             recognized.append(pretty_color_name(name))
+            spoken_fields.add("setting")
         elif token == "on":
             state["on"] = True
             recognized.append("on")
@@ -982,15 +998,19 @@ def _apply_command(text: str, state: dict[str, Any], *, allow_timer: bool = True
         elif token in {"brighter", "brighten", "bright", "up"}:
             state["brightness"] = min(1.0, state["brightness"] + BRIGHT_STEP)
             recognized.append("brighter")
+            spoken_fields.add("brightness")
         elif token in {"dimmer", "dim", "darker", "down"}:
             state["brightness"] = max(0.01, state["brightness"] - BRIGHT_STEP)
             recognized.append("dimmer")
+            spoken_fields.add("brightness")
         elif token == "half":
             state["brightness"] = 0.5
             recognized.append("50% brightness")
+            spoken_fields.add("brightness")
         elif token in {"full", "max", "maximum"}:
             state["brightness"] = 1.0
             recognized.append("100% brightness")
+            spoken_fields.add("brightness")
         index += 1
 
     if not recognized:
@@ -1005,7 +1025,10 @@ def _apply_command(text: str, state: dict[str, Any], *, allow_timer: bool = True
         state["color_name"] = color_name_for(state["color"])
     power = "on" if state["on"] else "off"
     summary = f"{', '.join(dict.fromkeys(recognized))} → {power}, {light_color_label(state)} at {round(state['brightness'] * 100)}%"
-    return CommandResult(True, summary, spoken=spoken_light_state(state))
+    spoken = spoken_light_state(
+        state, include_setting="setting" in spoken_fields, include_brightness="brightness" in spoken_fields,
+    )
+    return CommandResult(True, summary, spoken=spoken)
 
 
 def microphone_names() -> list[str]:
@@ -1350,11 +1373,19 @@ def start_listening(
                         })
                         was_paused = paused
                     try:
+                        if paused:
+                            # Drain one native chunk on this same thread, then
+                            # recheck the gate instead of entering a one-second
+                            # listen with an invalid capture token.
+                            source.stream.read(source.CHUNK)
+                            continue
                         audio = recognizer.listen(
                             source,
                             timeout=1,
                             phrase_time_limit=max(1.0, MIC_PHRASE_LIMIT),
                         )
+                    except PlaybackInterrupted:
+                        continue
                     except sr.WaitTimeoutError:
                         if playback_gate and playback_gate.token() is None:
                             continue
@@ -1517,6 +1548,8 @@ async def event_worker(
         if feedback:
             if result.category == "feedback" and result.changed:
                 feedback.settings_changed()
+            if normalize_command(text) == "feedback status":
+                console.status(feedback.engine_status())
             feedback.say(result.spoken, result.category)
         if source == "voice":
             provider = event.get("provider", "online") if isinstance(event, dict) else "online"
@@ -1580,6 +1613,7 @@ async def run() -> None:
         "feedback_volume": DEFAULT_FEEDBACK_VOLUME,
     }
     console.light_state(state, "Starting up")
+    console.status("Spoken feedback is off. Say or type 'enable spoken feedback' to hear confirmations.")
 
     shutdown = asyncio.Event()
     loop = asyncio.get_running_loop()

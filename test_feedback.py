@@ -5,8 +5,10 @@ import copy
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
+import speech_recognition as sr
+
 from main import COLORS, apply_command, event_worker, light_snapshot, timer_worker
-from speech_feedback import FeedbackFilteredStream, PlaybackGate, SpokenFeedback
+from speech_feedback import FeedbackFilteredStream, PlaybackGate, PlaybackInterrupted, SpokenFeedback
 
 
 def make_state():
@@ -69,7 +71,7 @@ class FeedbackCommandTests(unittest.TestCase):
 
 class PlaybackGateTests(unittest.TestCase):
     def test_self_speech_is_drained_silenced_and_rejected_even_after_it_ends(self):
-        gate = PlaybackGate(cooldown=0.4)
+        gate = PlaybackGate()
         native = Mock(spec=["read", "close"])
         native.read.return_value = b"\x01\x02" * 8
         stream = FeedbackFilteredStream(native, gate)
@@ -78,19 +80,23 @@ class PlaybackGateTests(unittest.TestCase):
             self.assertEqual(stream.read(8), native.read.return_value)
             gate.begin()
             self.assertIsNone(gate.token())
+            with self.assertRaises(PlaybackInterrupted):
+                stream.read(8)
             self.assertEqual(stream.read(8), bytes(16))
             gate.end()
             self.assertFalse(gate.accepts(token))
-            clock.return_value = 100.2
+            clock.return_value = 100.05
             self.assertEqual(stream.read(8), bytes(16))
-            clock.return_value = 100.5
+            clock.return_value = 100.11
+            with self.assertRaises(PlaybackInterrupted):
+                stream.read(8)
             self.assertEqual(stream.read(8), native.read.return_value)
             self.assertFalse(gate.accepts(token))
         self.assertEqual(native.read.call_count, 4)  # Keep the native buffer drained.
         stream.close()
         native.close.assert_called_once()
 
-    def test_feedback_starting_inside_one_read_is_also_filtered(self):
+    def test_feedback_starting_inside_one_read_interrupts_the_stale_capture(self):
         gate = PlaybackGate(cooldown=0)
         native = Mock(spec=["read", "close"])
 
@@ -100,7 +106,9 @@ class PlaybackGateTests(unittest.TestCase):
             return b"\x01\x02"
 
         native.read.side_effect = read
-        self.assertEqual(FeedbackFilteredStream(native, gate).read(1), b"\x00\x00")
+        with self.assertRaises(PlaybackInterrupted):
+            FeedbackFilteredStream(native, gate).read(1)
+        native.close.assert_not_called()
 
     def test_audio_buffered_during_recognition_is_discarded_after_playback(self):
         gate = PlaybackGate(cooldown=0)
@@ -112,10 +120,54 @@ class PlaybackGateTests(unittest.TestCase):
         # network response; no microphone reads run until afterward.
         gate.begin()
         gate.end()
+        with self.assertRaises(PlaybackInterrupted):
+            stream.read(2)
         self.assertEqual(stream.read(2), bytes(4))
         self.assertEqual(stream.read(2), bytes(4))
         self.assertEqual(stream.read(2), native.read.return_value)
         native.pyaudio_stream.get_read_available.assert_called_once()
+
+    def test_recognizer_can_capture_the_first_phrase_after_playback(self):
+        gate = PlaybackGate()
+        native = Mock(spec=["read", "close"])
+        source = Mock(spec=sr.AudioSource)
+        source.CHUNK, source.SAMPLE_RATE, source.SAMPLE_WIDTH = 160, 1600, 2
+        source.stream = FeedbackFilteredStream(native, gate)
+        silence = bytes(320)
+        speech = b"\xe8\x03" * 160
+        recognizer = sr.Recognizer()
+        recognizer.energy_threshold = 100
+        recognizer.dynamic_energy_threshold = False
+        recognizer.pause_threshold = 0.2
+        recognizer.non_speaking_duration = 0.1
+        recognizer.phrase_threshold = 0.1
+
+        def start_playback(size):
+            gate.begin()
+            return speech
+
+        with patch("speech_feedback.time.monotonic", return_value=100.0) as clock:
+            native.read.side_effect = start_playback
+            # Playback interrupts a recognizer already waiting for a phrase.
+            with self.assertRaises(PlaybackInterrupted):
+                recognizer.listen(source, timeout=1)
+            native.read.side_effect = None
+            native.read.return_value = speech
+            with self.assertRaises(PlaybackInterrupted):
+                source.stream.read(source.CHUNK)
+            self.assertEqual(source.stream.read(source.CHUNK), silence)
+
+            gate.end()
+            clock.return_value = 100.11
+            # Synchronize the new capture token without consuming user speech.
+            with self.assertRaises(PlaybackInterrupted):
+                source.stream.read(source.CHUNK)
+            capture_token = gate.token()
+            native.read.side_effect = [speech, speech, silence, silence, silence, b""]
+            audio = recognizer.listen(source, timeout=1)
+            self.assertTrue(audio.frame_data.startswith(speech * 2))
+            self.assertTrue(gate.accepts(capture_token))
+        native.close.assert_not_called()
 
 
 class FakeProcess:
@@ -150,7 +202,9 @@ class SpokenFeedbackTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.state = make_state()
         self.notify = Mock()
-        self.speaker = SpokenFeedback(self.state, self.notify)
+        # Keep eSpeak lifecycle tests independent of locally downloaded models.
+        with patch.dict("os.environ", {"TTS_ENGINE": "espeak"}):
+            self.speaker = SpokenFeedback(self.state, self.notify)
         self.speaker.gate.cooldown = 0
 
     async def asyncTearDown(self):

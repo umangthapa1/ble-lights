@@ -1,0 +1,2 @@
+# Optional local neural speech output (no cloud API needed).
+piper-tts>=1.8,<2

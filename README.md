@@ -26,8 +26,8 @@ reference.
 - Timed actions such as `sleep in 30 minutes` and `turn off in 1 hour`.
 - Undo, repeat, restore, toggle, timer status, and natural power aliases.
 - Visual alarms with snooze, acknowledge, dismiss, and cancel controls.
-- Offline spoken confirmations with adjustable volume, alarms-only mode, and
-  microphone echo suppression.
+- Natural offline Piper voices with cached confirmations, adjustable volume,
+  alarms-only mode, microphone echo suppression, and eSpeak fallback.
 - Smooth fades instead of abrupt color changes.
 - Automatic Bluetooth scanning and reconnecting.
 - `--list-mics` plus `MIC_DEVICE` support for choosing the correct input.
@@ -67,30 +67,63 @@ python -m pip install pocketsphinx
 
 ## Spoken feedback (optional)
 
-Install **eSpeak NG** for offline speech output. On CachyOS/Arch:
+Lumen prefers **Piper**, a local neural speech engine, using the US English
+`en_US-lessac-medium` voice. Install it in the same Python environment as Lumen
+and download the voice once from the project root:
 
 ```sh
-sudo pacman -S espeak-ng
+python -m pip install -r requirements-voice.txt
+python -m piper.download_voices en_US-lessac-medium --data-dir voices
 ```
 
-On Debian/Ubuntu: `sudo apt install espeak-ng`. Lumen uses `espeak-ng` from
-your PATH, or `espeak` if that is already installed. No additional Python
-package, API key, or internet connection is needed for speech output.
+With a uv-managed environment you can instead install with
+`uv pip install -r requirements-voice.txt`.
 
-Start Lumen and say or type:
+Both the `.onnx` model and its `.onnx.json` config must be present in `voices/`.
+They are ignored by Git; a fresh clone needs this download. Voice attribution
+and model details are in [`voices/README.md`](voices/README.md).
+
+On Linux, playback uses the first available command from **pw-play**, **paplay**,
+or **aplay**. CachyOS/Arch with PipeWire normally already has `pw-play`; if needed,
+install it with `sudo pacman -S pipewire-audio`. On Debian/Ubuntu, `sudo apt
+install alsa-utils` provides `aplay`.
+
+Piper loads the voice once in a dedicated background process and reuses it for
+later phrases. Up to 32 recent text/volume combinations (16 MiB total) are cached
+in memory. The first phrase includes model startup time; repeated confirmations
+skip synthesis entirely. Speech generation leaves microphone input available;
+only audible playback and a 100 ms echo cooldown suppress microphone commands.
+
+If Piper or its voice/player is unavailable, Lumen reports the reason and uses
+**eSpeak NG** as a fallback. Install the fallback with `sudo pacman -S espeak-ng`
+on CachyOS/Arch or `sudo apt install espeak-ng` on Debian/Ubuntu. An existing
+`espeak` executable is also accepted. Everything runs offline after installation
+and the voice download, with no API key.
+
+Feedback starts **off at every launch**. Start Lumen and enable it by saying or
+typing the following in Lumen's command prompt:
 
 ```text
 enable spoken feedback
 feedback volume 30
 ocean mode
-alarm in ten minutes
-only announce alarms
-mute feedback
 feedback status
 ```
 
-You will hear short confirmations such as “Ocean mode enabled. Brightness
-100 percent.” and “Alarm set for 10 minutes.”
+Replies match what you asked for: `ocean mode` says “Ocean mode enabled.”,
+`brightness 30` says “Brightness 30 percent.”, and `lights on` says “Lights on.”
+Combined commands such as `ocean mode brightness 30` confirm both settings.
+Use `status` for a full light-state announcement. `feedback status` shows the
+selected engine and voice, and playback logs say `Speaking via Piper`.
+
+If there is no speech, check `feedback status`: the mode must be `all` for light
+confirmations, with volume above 0%. Changing volume alone does not enable
+feedback. Use `only announce alarms` to restrict announcements, or `mute
+feedback` to turn them off.
+
+For another downloaded voice, set `PIPER_MODEL` to its `.onnx` path. Its matching
+`.onnx.json` file must be next to it. `TTS_ENGINE=espeak` explicitly selects the
+fallback; the default `TTS_ENGINE=auto` prefers Piper.
 
 - Feedback starts **muted**, with a volume setting of **70%**. These settings
   last for the current session.
@@ -106,9 +139,12 @@ You will hear short confirmations such as “Ocean mode enabled. Brightness
   cooldown), microphone commands are suppressed and captured audio is drained
   so it cannot trigger its own commands. Speak after the confirmation ends;
   keyboard commands remain available during playback.
-- If the speech engine is missing or fails, Lumen shows a terminal message and
-  keeps the light controller running. After installing the engine, use
-  `enable spoken feedback` again to retry.
+- If Piper synthesis/playback fails, Lumen tries eSpeak for that announcement
+  and subsequent speech. Use `enable spoken feedback` again to retry Piper.
+  If neither engine works, the terminal and light controller remain available.
+- Muting or exiting cancels pending speech; shutdown also stops the model
+  process. Cancelling an in-progress synthesis may require loading the model
+  again for the next uncached phrase.
 
 ## Choose a microphone
 
@@ -161,6 +197,8 @@ Available settings:
 | `MIC_TEST_SECONDS` | Duration of `--test-mic` | `2` |
 | `MIC_ENERGY_THRESHOLD` | Minimum voice level after calibration | `450` |
 | `AUDIO_TARGET_RMS` | Recognition volume normalization target | `6000` |
+| `TTS_ENGINE` | `auto` prefers Piper; `espeak` forces the fallback | `auto` |
+| `PIPER_MODEL` | Path to a Piper `.onnx` model (with adjacent `.onnx.json`) | `voices/en_US-lessac-medium.onnx`, relative to the project |
 
 Start it with:
 

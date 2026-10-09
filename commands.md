@@ -271,9 +271,19 @@ to restore the previous light state.
 
 ## Spoken feedback
 
-Install `espeak-ng` first (CachyOS/Arch: `sudo pacman -S espeak-ng`;
-Debian/Ubuntu: `sudo apt install espeak-ng`). Speech output is offline. See the
-[README setup instructions](README.md#spoken-feedback-optional).
+Piper is the preferred offline voice engine. Set it up once from the project
+root using the same Python environment as Lumen:
+
+```sh
+python -m pip install -r requirements-voice.txt
+python -m piper.download_voices en_US-lessac-medium --data-dir voices
+```
+
+On Linux, `pw-play`, `paplay`, or `aplay` plays the generated audio. The model
+stays loaded and repeated confirmations are cached. eSpeak NG is used as a
+fallback if Piper is unavailable. See the
+[README setup instructions](README.md#spoken-feedback-optional) for playback
+packages and voice configuration.
 
 | Command | What it does |
 | --- | --- |
@@ -285,13 +295,22 @@ Debian/Ubuntu: `sudo apt install espeak-ng`). Speech output is offline. See the
 | `feedback alarms only` | Alias for alarms-only feedback |
 | `mute feedback` | Stop playing/queued speech and disable announcements |
 | `disable spoken feedback`, `disable feedback` | Aliases for mute |
-| `feedback status` | Show the speech mode and volume in the terminal |
+| `feedback status` | Show the speech mode, volume, selected engine, and Piper voice |
 
 Examples of spoken confirmations:
 
-- `ocean mode` → “Ocean mode enabled. Brightness 100 percent.” (at full brightness)
+- `lights on` → “Lights on.”
+- `brightness 30` → “Brightness 30 percent.”
+- `ocean mode` → “Ocean mode enabled.”
+- `sleep mode` → “Sleep mode enabled.”
+- `blue` → “Blue lights on.”
+- `ocean mode brightness 30` → “Ocean mode enabled. Brightness 30 percent.”
 - `alarm in ten minutes` → “Alarm set for 10 minutes.”
 - When the alarm fires → “Your alarm is ringing. Say acknowledge alarm or snooze.”
+
+Confirmations describe only the requested settings. `brighter`, `dimmer`,
+`half`, and `full` announce the resulting brightness. Use `status` when you
+want the full light state read out.
 
 Feedback starts muted at a configured volume of 70% on each launch. Setting
 volume does not enable feedback; volume 0 is silent. Alarms-only mode includes
@@ -303,6 +322,10 @@ wait for the confirmation to finish before speaking again. You can type commands
 at any time. Speech settings are separate from the light's brightness and
 undo/repeat history. Feedback controls apply immediately and cannot be scheduled
 with a timer.
+
+Use `PIPER_MODEL=/path/to/voice.onnx python main.py` to select another downloaded
+voice. `TTS_ENGINE=espeak python main.py` forces the fallback. These settings
+apply at startup; the voice's `.onnx.json` config must accompany its model.
 
 ## History and repeat
 

@@ -3,3 +3,7 @@ __pycache__/
 *.py[cod]
 .env
 .DS_Store
+voices/*.onnx
+voices/*.onnx.json
+/*.onnx
+/*.onnx.json
