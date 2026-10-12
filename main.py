@@ -45,6 +45,7 @@ INTERVAL = 0.04
 SWAP_RB = os.getenv("SWAP_RB", "false").lower() in {"1", "true", "yes", "on"}
 LANGUAGE = os.getenv("VOICE_LANGUAGE", "en-US")
 MIC_DEVICE = os.getenv("MIC_DEVICE", "").strip()
+WAKE_PHRASE = os.getenv("WAKE_PHRASE", "hey lumen").strip().lower() or "hey lumen"
 
 
 def environment_float(name: str, default: float) -> float:
@@ -557,9 +558,12 @@ LISTEN_START_COMMANDS = {
     "start listening", "resume listening", "start microphone", "enable microphone",
     "unmute microphone", "listen for commands",
 }
-LISTEN_STOP_COMMANDS = {
-    "stop listening", "pause listening", "stop microphone", "disable microphone",
-    "mute microphone", "stop listening for commands",
+LISTEN_STANDBY_COMMANDS = {
+    "stop listening", "pause listening", "standby mode", "quiet mode",
+    "stop listening for commands",
+}
+LISTEN_OFF_COMMANDS = {
+    "stop microphone", "disable microphone", "mute microphone",
 }
 
 
@@ -567,15 +571,23 @@ def listening_command(text: str, state: dict[str, Any]) -> CommandResult | None:
     """Handle microphone listening controls outside light history."""
 
     if text in LISTEN_START_COMMANDS:
-        already_enabled = state.get("_listening_enabled", True)
+        already_enabled = state.get("_listening_mode", "active") == "active"
         state["_listening_enabled"] = True
+        state["_listening_mode"] = "active"
         summary = "Microphone is already listening." if already_enabled else "Microphone listening started."
         return CommandResult(not already_enabled, summary, spoken=summary, category="microphone")
-    if text in LISTEN_STOP_COMMANDS:
-        already_disabled = not state.get("_listening_enabled", True)
+    if text in LISTEN_STANDBY_COMMANDS:
+        already_standby = state.get("_listening_mode", "active") == "standby"
         state["_listening_enabled"] = False
-        summary = "Microphone is already paused." if already_disabled else "Microphone listening stopped."
-        return CommandResult(not already_disabled, summary, spoken=summary, category="microphone")
+        state["_listening_mode"] = "standby"
+        summary = f"Microphone is already in standby. Say '{WAKE_PHRASE}' to wake it." if already_standby else f"Microphone standby enabled. Say '{WAKE_PHRASE}' to wake it."
+        return CommandResult(not already_standby, summary, spoken=summary, category="microphone")
+    if text in LISTEN_OFF_COMMANDS:
+        already_off = state.get("_listening_mode", "active") == "off"
+        state["_listening_enabled"] = False
+        state["_listening_mode"] = "off"
+        summary = "Microphone is already disabled." if already_off else "Microphone disabled."
+        return CommandResult(not already_off, summary, spoken=summary, category="microphone")
     return None
 
 
@@ -881,6 +893,38 @@ def prepare_audio_for_recognition(audio: sr.AudioData) -> tuple[sr.AudioData, in
     return sr.AudioData(cleaned, audio.sample_rate, width), raw_level, audioop.rms(cleaned, width)
 
 
+def recognize_standby_audio(
+    recognizer: sr.Recognizer, audio: sr.AudioData,
+) -> tuple[str, str] | None:
+    """Transcribe standby phrases online first, with PocketSphinx fallback."""
+
+    try:
+        cleaned_audio, _, _ = prepare_audio_for_recognition(audio)
+    except Exception:
+        cleaned_audio = audio
+
+    try:
+        return recognizer.recognize_google(audio, language=LANGUAGE), "online wake phrase"
+    except sr.UnknownValueError:
+        if cleaned_audio is audio:
+            return None
+        try:
+            return recognizer.recognize_google(cleaned_audio, language=LANGUAGE), "online normalized wake phrase"
+        except sr.UnknownValueError:
+            return None
+        except sr.RequestError:
+            pass
+    except sr.RequestError:
+        pass
+    except Exception:
+        return None
+
+    try:
+        return recognizer.recognize_sphinx(cleaned_audio, language=LANGUAGE), "offline wake phrase"
+    except Exception:
+        return None
+
+
 def target_rgb(state: dict[str, Any], now: float | None = None) -> tuple[float, float, float]:
     current = time.monotonic() if now is None else now
     alarm = state.get("alarm")
@@ -1055,7 +1099,7 @@ def _apply_command(text: str, state: dict[str, Any], *, allow_timer: bool = True
     if re.search(r"\bfeedback\b", normalized) or normalized.startswith("only announce"):
         return CommandResult(False, "Use feedback controls directly; they cannot be scheduled.")
 
-    if normalized in LISTEN_START_COMMANDS | LISTEN_STOP_COMMANDS:
+    if normalized in LISTEN_START_COMMANDS | LISTEN_STANDBY_COMMANDS | LISTEN_OFF_COMMANDS:
         return CommandResult(False, "Microphone controls cannot be scheduled.")
 
     if (
@@ -1455,10 +1499,47 @@ def post_event(loop: asyncio.AbstractEventLoop, event_queue: asyncio.Queue, even
         pass
 
 
+class ListeningMode:
+    """Thread-safe microphone mode shared by the asyncio worker and listener."""
+
+    ACTIVE = "active"
+    STANDBY = "standby"
+    OFF = "off"
+
+    def __init__(self, initial: str = ACTIVE) -> None:
+        self._lock = threading.Lock()
+        self._value = initial
+
+    def get(self) -> str:
+        with self._lock:
+            return self._value
+
+    def set(self, value: str) -> None:
+        if value not in {self.ACTIVE, self.STANDBY, self.OFF}:
+            raise ValueError(f"Unknown microphone mode: {value}")
+        with self._lock:
+            self._value = value
+
+
+def wake_command(text: str) -> str | None:
+    """Return the command after the configured local wake phrase."""
+
+    normalized = " ".join(text.lower().strip().split())
+    wake = re.escape(WAKE_PHRASE)
+    aliases = [wake]
+    if WAKE_PHRASE == "hey lumen":
+        aliases.extend((r"hey\s+lumen", r"hey\s+lemon", r"lumen"))
+    match = re.match(r"^(?:" + "|".join(aliases) + r")\b[\s,.:;!?-]*(.*)$", normalized)
+    if not match:
+        return None
+    return normalize_command(match.group(1).strip() or "start listening")
+
+
 def start_listening(
     loop: asyncio.AbstractEventLoop,
     event_queue: asyncio.Queue,
     playback_gate: PlaybackGate | None = None,
+    listening_mode: ListeningMode | None = None,
 ) -> Callable[..., Any] | None:
     """Start background microphone recognition, returning its stop callback.
 
@@ -1467,6 +1548,7 @@ def start_listening(
     Bluetooth reconnection.
     """
 
+    listening_mode = listening_mode or ListeningMode()
     try:
         with silence_audio_backend_output():
             mic = StableMicrophone(MIC_DEVICE)
@@ -1571,6 +1653,23 @@ def start_listening(
         else:
             post_event(loop, event_queue, {"kind": "mic", "phase": "listening", "message": "No words recognized — listening again…"})
 
+    def on_standby_audio(audio: sr.AudioData, capture_token: int | None) -> None:
+        """Recognize a wake-prefixed command before routing it normally."""
+
+        recognized = recognize_standby_audio(recognizer, audio)
+        if recognized is None:
+            return
+        text, provider = recognized
+        command = wake_command(text or "")
+        if command is None:
+            return
+        if playback_gate and not playback_gate.accepts(capture_token):
+            return
+        post_event(loop, event_queue, {
+            "kind": "command", "source": "voice", "provider": provider,
+            "text": command, "capture_token": capture_token,
+        })
+
     running = threading.Event()
     running.set()
     stream_ready = threading.Event()
@@ -1594,6 +1693,10 @@ def start_listening(
                 idle_windows = 0
                 was_paused = False
                 while running.is_set():
+                    mode = listening_mode.get()
+                    if mode == ListeningMode.OFF:
+                        time.sleep(0.05)
+                        continue
                     capture_token = playback_gate.token() if playback_gate else None
                     paused = playback_gate is not None and capture_token is None
                     if paused != was_paused:
@@ -1629,7 +1732,10 @@ def start_listening(
                         continue
                     idle_windows = 0
                     if running.is_set() and (not playback_gate or playback_gate.accepts(capture_token)):
-                        on_audio(recognizer, audio, capture_token)
+                        if listening_mode.get() == ListeningMode.STANDBY:
+                            on_standby_audio(audio, capture_token)
+                        elif listening_mode.get() == ListeningMode.ACTIVE:
+                            on_audio(recognizer, audio, capture_token)
         except Exception as exc:
             startup_error.append(str(exc))
             stream_ready.set()
@@ -1669,43 +1775,59 @@ class MicrophoneController:
         self.loop = loop
         self.event_queue = event_queue
         self.playback_gate = playback_gate
+        self.listening_mode = ListeningMode()
         self.stop_callback: Callable[..., Any] | None = None
-        self.enabled = False
+        self.running = False
         self._lock = asyncio.Lock()
+
+    @property
+    def enabled(self) -> bool:
+        return self.running and self.listening_mode.get() == ListeningMode.ACTIVE
 
     async def start(self) -> bool:
         async with self._lock:
-            if self.enabled:
+            if self.running:
+                self.listening_mode.set(ListeningMode.ACTIVE)
                 return True
+            self.listening_mode.set(ListeningMode.ACTIVE)
             stop_callback = await asyncio.to_thread(
-                start_listening, self.loop, self.event_queue, self.playback_gate,
+                start_listening, self.loop, self.event_queue, self.playback_gate, self.listening_mode,
             )
             if stop_callback is None:
                 self.stop_callback = None
-                self.enabled = False
+                self.running = False
                 return False
             self.stop_callback = stop_callback
-            self.enabled = True
+            self.running = True
+            return True
+
+    async def standby(self) -> bool:
+        async with self._lock:
+            if not self.running or self.stop_callback is None:
+                return False
+            self.listening_mode.set(ListeningMode.STANDBY)
             return True
 
     async def stop(self) -> bool:
         async with self._lock:
-            if not self.enabled or self.stop_callback is None:
-                self.enabled = False
+            self.listening_mode.set(ListeningMode.OFF)
+            if not self.running or self.stop_callback is None:
+                self.running = False
                 self.stop_callback = None
                 return True
             stop_callback, self.stop_callback = self.stop_callback, None
-            self.enabled = False
+            self.running = False
             await asyncio.to_thread(stop_callback)
             return True
 
     async def close(self) -> None:
         async with self._lock:
+            self.listening_mode.set(ListeningMode.OFF)
             if self.stop_callback is None:
-                self.enabled = False
+                self.running = False
                 return
             stop_callback, self.stop_callback = self.stop_callback, None
-            self.enabled = False
+            self.running = False
             await asyncio.to_thread(stop_callback, False)
 
 
@@ -1800,6 +1922,7 @@ def hud_snapshot(state: dict[str, Any]) -> dict[str, Any]:
         "listening": "▂▃▂▃▂▃",
         "captured": "▂▅▇█▇▅",
         "paused": "▁▁▁▁▁▁",
+        "standby": "· · · · · ·",
         "offline": "× × × ×",
     }
     return {
@@ -1820,6 +1943,7 @@ def hud_snapshot(state: dict[str, Any]) -> dict[str, Any]:
         "alarm": alarm_label(state) or "none",
         "device": ADDRESS,
         "language": LANGUAGE,
+        "wake_phrase": WAKE_PHRASE,
         "clock": clock["clock"],
         "calendar": f"{clock['day']} · {clock['date']}",
     }
@@ -1869,15 +1993,34 @@ async def event_worker(
             shutdown.set()
             continue
         if result.category == "microphone" and microphone:
-            requested = state.get("_listening_enabled", True)
-            ready = await microphone.start() if requested else await microphone.stop()
-            state["_listening_enabled"] = microphone.enabled if requested else False
-            if requested and not ready:
+            requested_mode = state.get("_listening_mode", "active")
+            if requested_mode == "active":
+                ready = await microphone.start()
+            elif requested_mode == "standby":
+                ready = await microphone.standby()
+            else:
+                ready = await microphone.stop()
+            state["_listening_enabled"] = microphone.enabled
+            if requested_mode == "active" and not ready:
                 result.changed = False
                 result.summary = "Microphone could not start; check the microphone status."
                 result.spoken = result.summary
-            state["_mic_status"] = "READY" if microphone.enabled else "PAUSED"
-            state["_mic_phase"] = "listening" if microphone.enabled else "paused"
+            if requested_mode == "standby" and not ready:
+                result.changed = False
+                result.summary = "Microphone is not running, so standby mode could not start."
+                result.spoken = result.summary
+            state["_mic_status"] = (
+                "READY" if microphone.enabled
+                else "STANDBY" if requested_mode == "standby"
+                else "OFFLINE" if requested_mode == "off"
+                else "PAUSED"
+            )
+            state["_mic_phase"] = (
+                "listening" if microphone.enabled
+                else "standby" if requested_mode == "standby"
+                else "offline" if requested_mode == "off"
+                else "paused"
+            )
         if result.category in {"clock", "microphone"}:
             console.status(personality_response(result.summary, state, result.category))
         else:
@@ -1896,7 +2039,10 @@ async def event_worker(
             provider = event.get("provider", "online") if isinstance(event, dict) else "online"
             console.status(f"Recognized via {provider} speech input.", "success")
             if microphone and not microphone.enabled:
-                console.mic_indicator("paused", "Listening paused. Type `start listening` to resume.")
+                if state.get("_listening_mode") == "standby":
+                    console.mic_indicator("paused", f"Standby active. Say `{WAKE_PHRASE}` to wake me.")
+                else:
+                    console.mic_indicator("offline", "Microphone off. Type `start listening` to resume.")
             else:
                 console.mic_indicator("listening", "Waiting for your next command…")
 
@@ -1962,6 +2108,7 @@ async def run() -> None:
         "_mic_status": "STARTING",
         "_mic_phase": "listening",
         "_listening_enabled": True,
+        "_listening_mode": "active",
     }
 
     shutdown = asyncio.Event()

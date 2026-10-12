@@ -143,7 +143,7 @@ class TerminalHUD:
             self._columns((f"ALARM  {data['alarm']}",
                            f"DEVICE  {data['device']}",
                            "HUD  LIVE"), width, "class:muted"),
-            self._box_row(f"LOCAL  {data['clock']}  ·  {data['calendar']}", width, "class:label"),
+            self._box_row(f"LOCAL  {data['clock']}  ·  {data['calendar']}  ·  WAKE '{data['wake_phrase']}'", width, "class:label"),
             [("class:title", "╰" + "─" * (width - 2) + "╯")],
         ]
         rendered = []

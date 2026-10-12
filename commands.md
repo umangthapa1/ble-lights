@@ -398,15 +398,21 @@ still reports the active timer's countdown.
 
 | Command | What it does |
 | --- | --- |
-| `stop listening` | Close the microphone stream and pause voice recognition |
+| `stop listening` | Enter standby; keep a local wake-phrase detector ready |
 | `pause listening` | Alias for `stop listening` |
-| `start listening` | Reopen and recalibrate the microphone |
+| `start listening` | Return to active recognition, reopening/recalibrating if needed |
 | `resume listening` | Alias for `start listening` |
 
 Additional aliases include `start microphone`, `stop microphone`, `enable
-microphone`, and `disable microphone`. When voice input is paused, enter
-`start listening` in the HUD's typed command field. The microphone indicator
-shows `READY`, `PAUSED`, or `OFFLINE`.
+microphone`, and `disable microphone`. Say `Hey Lumen, turn the lights off` in
+standby to wake Lumen and run the command. `stop microphone` is the hard privacy
+off mode and requires typing `start listening` in the HUD to resume. The
+microphone indicator shows `READY`, `STANDBY`, `PAUSED`, or `OFFLINE`.
+
+The default wake phrase is `hey lumen`; set `WAKE_PHRASE` to customize it.
+Standby uses Google recognition first and only routes a phrase when its
+recognized text begins with the wake phrase. PocketSphinx is used as an offline
+fallback when Google is unavailable.
 
 ## Information and help
 

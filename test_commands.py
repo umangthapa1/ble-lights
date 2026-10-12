@@ -3,7 +3,9 @@
 import copy
 from datetime import datetime
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+import speech_recognition as sr
 
 from main import (
     COLORS,
@@ -14,11 +16,14 @@ from main import (
     apply_due_timer,
     effect_rgb,
     hud_snapshot,
+    ListeningMode,
     local_clock,
     personality_response,
+    recognize_standby_audio,
     scene_label,
     target_rgb,
     timer_label,
+    wake_command,
 )
 
 
@@ -380,7 +385,7 @@ class CommandTests(unittest.TestCase):
 
         result = apply_command("pause listening", self.state)
         self.assertFalse(result.changed)
-        self.assertIn("already paused", result.summary)
+        self.assertIn("already in standby", result.summary)
 
         result = apply_command("resume listening", self.state)
         self.assertTrue(result.changed)
@@ -388,6 +393,37 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(result.spoken, "Microphone listening started.")
         self.assertFalse(apply_command("stop listening in 5 minutes", self.state).changed)
         self.assertIsNone(self.state.get("timer"))
+
+    def test_standby_uses_wake_phrase_and_preserves_command_text(self):
+        self.assertEqual(wake_command("hey lumen, turn the lights off"), "off")
+        self.assertEqual(wake_command("Hey Lemon set brightness 20"), "set brightness 20")
+        self.assertEqual(wake_command("lumen what time is it"), "what time is it")
+        self.assertIsNone(wake_command("turn the lights off"))
+
+        self.state.update(_listening_enabled=True, _listening_mode=ListeningMode.ACTIVE)
+        result = apply_command("stop listening", self.state)
+        self.assertEqual(result.category, "microphone")
+        self.assertEqual(self.state["_listening_mode"], ListeningMode.STANDBY)
+        self.assertFalse(self.state["_listening_enabled"])
+        result = apply_command(wake_command("hey lumen, turn the lights off"), self.state)
+        self.assertFalse(result.should_exit)
+        self.assertFalse(self.state["on"])
+
+    def test_standby_transcription_prefers_google_and_falls_back_to_sphinx(self):
+        audio = Mock()
+        recognizer = Mock()
+        with patch("main.prepare_audio_for_recognition", return_value=(audio, 0, 0)):
+            recognizer.recognize_google.return_value = "hey lumen turn the lights off"
+            self.assertEqual(
+                recognize_standby_audio(recognizer, audio),
+                ("hey lumen turn the lights off", "online wake phrase"),
+            )
+            recognizer.recognize_google.side_effect = sr.RequestError("offline")
+            recognizer.recognize_sphinx.return_value = "hey lumen turn the lights off"
+            self.assertEqual(
+                recognize_standby_audio(recognizer, audio),
+                ("hey lumen turn the lights off", "offline wake phrase"),
+            )
 
 
 def light_snapshot_fields(state):

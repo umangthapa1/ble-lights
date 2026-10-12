@@ -67,9 +67,10 @@ For fish, activate with `source .venv/bin/activate.fish`. On Windows, use
 `.venv\\Scripts\\activate`. On macOS, install PortAudio with Homebrew
 (`brew install portaudio`) if the audio dependency needs to build.
 
-Bluetooth access, a working microphone, and internet access for Google's
-online speech recognizer are required. To add an offline fallback, install
-PocketSphinx in the virtual environment:
+Bluetooth access and a working microphone are required. Google speech
+recognition still uses internet access during normal active listening. The
+project installs PocketSphinx for offline standby wake-phrase detection and
+offline recognition through `requirements.txt`:
 
 ```sh
 python -m pip install pocketsphinx
@@ -205,6 +206,7 @@ Available settings:
 | `ASSISTANT_NAME` | Name shown in the HUD and used by assistant queries | `Lumen` |
 | `LUMEN_PERSONALITY` | Starting response profile; `jarvis` aliases to `cinematic` | `professional` |
 | `NO_HUD` | Disable the full-screen HUD and use the scrolling terminal | unset |
+| `WAKE_PHRASE` | Wake phrase used in standby mode | `hey lumen` |
 | `MIC_CALIBRATION_SECONDS` | Ambient-noise calibration length | `1` |
 | `MIC_PHRASE_LIMIT` | Maximum length of each phrase | `4` |
 | `MIC_TEST_SECONDS` | Duration of `--test-mic` | `2` |
@@ -392,11 +394,20 @@ start listening
 resume listening
 ```
 
-Stopping closes the active microphone stream and prevents voice commands from
-being captured. Starting listening reopens the selected device and recalibrates
-ambient noise. While listening is paused, the HUD's typed command field remains
-available, so `start listening` can be entered there to resume voice control.
-The HUD shows `READY`, `PAUSED`, or `OFFLINE` for the microphone state.
+`stop listening` enters standby: the microphone remains open, but normal voice
+recognition is paused. Say the configured wake phrase followed by a command, for
+example `Hey Lumen, turn the lights off`, to wake Lumen and run that command.
+Standby sends captured phrases to Google's recognizer first, then accepts them
+only when the recognized text begins with the wake phrase.
+
+`stop microphone` is the hard privacy-off command. It closes the microphone
+stream completely; resume it with the typed `start listening` command in the HUD.
+Starting listening reopens the selected device and recalibrates ambient noise.
+The HUD shows `READY`, `STANDBY`, `PAUSED`, or `OFFLINE` for the microphone
+state. The default wake phrase is `hey lumen`; customize it with `WAKE_PHRASE`.
+
+If Google is unavailable, standby falls back to the offline PocketSphinx package
+included in `requirements.txt`.
 
 ## Terminal HUD and personalities
 
