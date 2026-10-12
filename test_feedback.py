@@ -2,6 +2,7 @@
 
 import asyncio
 import copy
+from datetime import datetime
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -341,6 +342,33 @@ class SpokenFeedbackTests(unittest.IsolatedAsyncioTestCase):
         await event_worker(events, self.state, asyncio.Event(), Mock(), self.speaker)
         self.assertEqual(self.state["color"], COLORS["warm"])
         self.assertEqual(self.state["brightness"], 0.3)
+
+    async def test_clock_replies_use_personality_and_obey_speech_settings(self):
+        expected = {
+            "professional": "The time is 9:42 PM.",
+            "minimal": "9:42 PM.",
+            "playful": "The time is 9:42 PM. Consider yourself up to date!",
+            "sarcastic": "The time is 9:42 PM. Keeping track so you don't have to.",
+            "cinematic": "The time is 9:42 PM. At your service.",
+        }
+        for profile, answer in expected.items():
+            for mode, volume in (("all", 70), ("off", 70), ("alarms", 70), ("all", 0)):
+                with self.subTest(profile=profile, mode=mode, volume=volume):
+                    self.state.update(personality=profile, feedback_mode=mode, feedback_volume=volume)
+                    events = asyncio.Queue()
+                    events.put_nowait({"kind": "command", "source": "voice", "text": "what time is it"})
+                    events.put_nowait({"kind": "command", "source": "keyboard", "text": "quit"})
+                    console = Mock()
+                    with patch("main.datetime") as clock, \
+                         patch("speech_feedback.shutil.which", return_value="espeak-ng"):
+                        clock.now.return_value.astimezone.return_value = datetime(2026, 10, 10, 21, 42)
+                        await event_worker(events, self.state, asyncio.Event(), console, self.speaker)
+                    console.status.assert_any_call(answer)
+                    console.light_state.assert_not_called()
+                    if mode == "all" and volume:
+                        self.assertEqual(self.speaker.queue.get_nowait(), (answer, "clock"))
+                        self.speaker.queue.task_done()
+                    self.assertTrue(self.speaker.queue.empty())
 
     async def test_alarm_announcement_occurs_once_even_in_alarms_only_mode(self):
         self.state.update(feedback_mode="alarms", alarm={"deadline": 0, "active": False})

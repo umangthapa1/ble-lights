@@ -1,9 +1,25 @@
 """Command-level checks; no microphone, network, or Bluetooth hardware needed."""
 
 import copy
+from datetime import datetime
 import unittest
+from unittest.mock import patch
 
-from main import COLORS, EFFECTS, alarm_rgb, apply_command, apply_due_alarm, apply_due_timer, effect_rgb, scene_label, target_rgb, timer_label
+from main import (
+    COLORS,
+    EFFECTS,
+    alarm_rgb,
+    apply_command,
+    apply_due_alarm,
+    apply_due_timer,
+    effect_rgb,
+    hud_snapshot,
+    local_clock,
+    personality_response,
+    scene_label,
+    target_rgb,
+    timer_label,
+)
 
 
 class CommandTests(unittest.TestCase):
@@ -269,6 +285,92 @@ class CommandTests(unittest.TestCase):
                 self.assertEqual(self.state, before)
         self.assertIn("sleep mode", apply_command("status", self.state).summary)
         self.assertTrue(apply_command("quit", self.state).should_exit)
+
+    def test_personality_profiles_and_assistant_name_do_not_enter_light_history(self):
+        apply_command("blue", self.state)
+        light = copy.deepcopy(self.state)
+        history = copy.deepcopy(self.state["_history"])
+
+        self.assertTrue(apply_command("personality playful", self.state).changed)
+        self.assertEqual(self.state["personality"], "playful")
+        self.assertEqual(personality_response("Lights on.", self.state), "Done — Lights on.")
+        self.assertTrue(apply_command("set assistant name Jarvis", self.state).changed)
+        self.assertEqual(self.state["assistant_name"], "Jarvis")
+        self.assertEqual(light_snapshot_fields(self.state), light_snapshot_fields(light))
+        self.assertEqual(self.state["_history"], history)
+
+        apply_command("personality jarvis", self.state)
+        self.assertEqual(self.state["personality"], "cinematic")
+        self.assertEqual(personality_response("Lights on.", self.state), "As you wish. Lights on.")
+        self.assertFalse(apply_command("personality banana", self.state).changed)
+
+    def test_hud_snapshot_contains_live_assistant_and_light_state(self):
+        self.state.update(
+            assistant_name="Jarvis", personality="cinematic", _connection="CONNECTED",
+            _mic_status="READY", _mic_phase="listening",
+        )
+        apply_command("brightness 40", self.state)
+        snapshot = hud_snapshot(self.state)
+        self.assertEqual(snapshot["name"], "Jarvis")
+        self.assertEqual(snapshot["connection"], "CONNECTED")
+        self.assertEqual(snapshot["brightness"], 40)
+        self.assertEqual(snapshot["rgb"], (102, 56, 16))
+
+    def test_clock_queries_answer_without_changing_light_history_or_timers(self):
+        apply_command("ocean mode", self.state)
+        apply_command("off in 20 minutes", self.state)
+        apply_command("alarm in 10 minutes", self.state)
+        before = copy.deepcopy(self.state)
+        cases = {
+            "time": "The time is 9:42 PM.",
+            "What is the time?": "The time is 9:42 PM.",
+            "what’s the time": "The time is 9:42 PM.",
+            "what time is it now": "The time is 9:42 PM.",
+            "Can you please tell me the time?": "The time is 9:42 PM.",
+            "date": "Today's date is October 10, 2026.",
+            "What's today's date?": "Today's date is October 10, 2026.",
+            "what is the date today": "Today's date is October 10, 2026.",
+            "day": "Today is Saturday.",
+            "what day is it": "Today is Saturday.",
+            "what day is today please": "Today is Saturday.",
+            "what day of the week is it": "Today is Saturday.",
+        }
+        with patch("main.datetime") as clock:
+            clock.now.return_value.astimezone.return_value = datetime(2026, 10, 10, 21, 42, 3)
+            for command, answer in cases.items():
+                with self.subTest(command=command):
+                    result = apply_command(command, self.state)
+                    self.assertFalse(result.changed)
+                    self.assertEqual(result.category, "clock")
+                    self.assertEqual(result.summary, answer)
+                    self.assertEqual(result.spoken, answer)
+                    self.assertEqual(self.state, before)
+
+        for command in ("time remaining", "timer status", "time in 5 minutes", "date for 5 minutes"):
+            with self.subTest(command=command):
+                result = apply_command(command, self.state)
+                self.assertNotEqual(result.category, "clock")
+                self.assertFalse(result.changed)
+                self.assertEqual(self.state, before)
+
+    def test_local_clock_and_hud_roll_over_at_midnight_and_handle_noon(self):
+        cases = [
+            (datetime(2028, 2, 28, 23, 59, 59), "11:59 PM", "11:59:59 PM", "Monday", "February 28, 2028"),
+            (datetime(2028, 2, 29, 0, 0, 0), "12:00 AM", "12:00:00 AM", "Tuesday", "February 29, 2028"),
+            (datetime(2028, 2, 29, 12, 0, 1), "12:00 PM", "12:00:01 PM", "Tuesday", "February 29, 2028"),
+        ]
+        with patch("main.datetime") as clock:
+            for now, short_time, full_time, day, date in cases:
+                with self.subTest(now=now):
+                    clock.now.return_value.astimezone.return_value = now
+                    self.assertEqual(local_clock(), {"time": short_time, "clock": full_time, "day": day, "date": date})
+                    snapshot = hud_snapshot(self.state)
+                    self.assertEqual(snapshot["clock"], full_time)
+                    self.assertEqual(snapshot["calendar"], f"{day} · {date}")
+
+
+def light_snapshot_fields(state):
+    return {key: state.get(key) for key in ("on", "color", "color_name", "brightness", "mode", "effect", "effect_color", "timer", "alarm")}
 
 
 if __name__ == "__main__":

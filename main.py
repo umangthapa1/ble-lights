@@ -22,12 +22,14 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Callable
 
 import speech_recognition as sr
 from bleak import BleakClient, BleakScanner
 
 from speech_feedback import DEFAULT_FEEDBACK_VOLUME, FeedbackFilteredStream, PlaybackGate, PlaybackInterrupted, SpokenFeedback
+from terminal_hud import TerminalHUD
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -194,6 +196,25 @@ COMMAND_ALIASES = {
 
 LIGHT_FIELDS = ("on", "color", "color_name", "brightness", "mode", "effect", "effect_color", "timer", "alarm")
 
+PERSONALITIES = {
+    "professional": "",
+    "minimal": "",
+    "playful": "Done — ",
+    "sarcastic": "Naturally. ",
+    "cinematic": "As you wish. ",
+}
+
+PERSONALITY_ALIASES = {
+    "default": "professional",
+    "formal": "professional",
+    "fun": "playful",
+    "jarvis": "cinematic",
+    "dramatic": "cinematic",
+}
+
+DEFAULT_ASSISTANT_NAME = os.getenv("ASSISTANT_NAME", "Lumen").strip() or "Lumen"
+DEFAULT_PERSONALITY = PERSONALITY_ALIASES.get(os.getenv("LUMEN_PERSONALITY", "professional").strip().lower(), "professional")
+
 
 @dataclass
 class CommandResult:
@@ -220,8 +241,9 @@ class Console:
     MAGENTA = "\033[95m"
     WHITE = "\033[97m"
 
-    def __init__(self) -> None:
+    def __init__(self, dashboard: TerminalHUD | None = None) -> None:
         self.enabled = sys.stdout.isatty() and not os.getenv("NO_COLOR")
+        self.dashboard = dashboard
 
     def style(self, text: str, color: str = "", *, bold: bool = False) -> str:
         if not self.enabled:
@@ -230,6 +252,9 @@ class Console:
         return f"{prefix}{text}{self.RESET}" if prefix else text
 
     def write(self, text: str = "") -> None:
+        if self.dashboard:
+            self.dashboard.write(text)
+            return
         print(text, flush=True)
 
     def banner(self) -> None:
@@ -299,6 +324,46 @@ class Console:
         self.write(line)
         if summary:
             self.write(f"  {self.style('↳', self.DIM)}  {summary}")
+
+    def hud(self, state: dict[str, Any], *, force: bool = False) -> None:
+        """Render a compact Jarvis-style snapshot of the live system state."""
+
+        if self.dashboard:
+            self.dashboard.app.invalidate()
+            return
+        if not force:
+            return
+
+        assistant = str(state.get("assistant_name", "Lumen")).upper()
+        connection = str(state.get("_connection", "SCANNING")).upper()
+        mic = str(state.get("_mic_status", "STARTING")).upper()
+        mode = state.get("feedback_mode", "off")
+        volume = int(state.get("feedback_volume", DEFAULT_FEEDBACK_VOLUME))
+        feedback = f"{mode.upper()} · {volume}%"
+        scene = scene_label(state) or "manual"
+        power = "ON" if state.get("on") else "OFF"
+        color = pretty_color_name(light_color_label(state))
+        brightness = round(float(state.get("brightness", 0.0)) * 100)
+        timer = timer_label(state) or "none"
+        alarm = alarm_label(state) or "none"
+        personality = str(state.get("personality", "professional")).upper()
+        clock = local_clock()
+
+        lines = [
+            f"{assistant} CORE  ·  {connection}",
+            f"LIGHT       {power:<3} · {color.upper():<10} · {brightness:>3}% · {scene.upper()}",
+            f"MIC         {mic:<10} · VOICE {LANGUAGE}",
+            f"FEEDBACK    {feedback:<14} · PERSONALITY {personality}",
+            f"TIMER       {timer}",
+            f"ALARM       {alarm}",
+            f"LOCAL       {clock['clock']} · {clock['day']} · {clock['date']}",
+        ]
+        width = 64
+        self.write()
+        self.write(self.style("╭" + "─" * width + "╮", self.CYAN))
+        for line in lines:
+            self.write(self.style("│ " + line[:width - 2].ljust(width - 2) + " │", self.CYAN))
+        self.write(self.style("╰" + "─" * width + "╯", self.CYAN))
 
     def prompt_help(self, mic_ready: bool) -> None:
         if mic_ready:
@@ -419,6 +484,119 @@ def feedback_command(text: str, state: dict[str, Any]) -> CommandResult | None:
 
     if re.search(r"\bfeedback\b", text) or text.startswith("only announce"):
         return CommandResult(False, "Try 'enable spoken feedback', 'feedback volume 30', 'only announce alarms', or 'mute feedback'.", category="feedback")
+    return None
+
+
+def personality_response(
+    text: str | None, state: dict[str, Any], category: str = "command",
+) -> str | None:
+    """Apply the selected response style without changing the underlying text."""
+
+    if not text:
+        return text
+    personality = state.get("personality", "professional")
+    if category == "clock":
+        if personality == "minimal":
+            return re.sub(r"^(?:The time is |Today's date is |Today is )", "", text)
+        suffix = {
+            "playful": " Consider yourself up to date!",
+            "sarcastic": " Keeping track so you don't have to.",
+            "cinematic": " At your service.",
+        }.get(personality, "")
+        return text + suffix
+    if personality == "minimal":
+        text = text.replace(" mode enabled.", " enabled.")
+    prefix = PERSONALITIES.get(personality, PERSONALITIES["professional"])
+    return f"{prefix}{text}" if prefix else text
+
+
+def personality_command(text: str, state: dict[str, Any]) -> CommandResult | None:
+    """Handle assistant personality and display-name settings."""
+
+    if text in {"personality", "personality status", "show personality", "what is your personality"}:
+        personality = state.get("personality", "professional")
+        name = state.get("assistant_name", "Lumen")
+        return CommandResult(False, f"{name}'s personality is {personality}.", category="personality")
+
+    if text in {"assistant name", "show assistant name", "what is your name", "who are you"}:
+        return CommandResult(False, f"I am {state.get('assistant_name', 'Lumen')}.", category="personality")
+
+    personality_match = re.fullmatch(r"(?:set |use )?(?:the )?personality(?: to| as)? ([a-z][a-z0-9_-]*)", text)
+    if personality_match:
+        requested = personality_match[1]
+        personality = PERSONALITY_ALIASES.get(requested, requested)
+        if personality not in PERSONALITIES:
+            choices = ", ".join(PERSONALITIES)
+            return CommandResult(False, f"Unknown personality. Choose: {choices}.", category="personality")
+        state["personality"] = personality
+        summary = f"Personality set to {personality}."
+        return CommandResult(True, summary, spoken=summary, category="personality")
+
+    name_match = re.fullmatch(
+        r"(?:set |rename )?(?:the )?(?:assistant name|yourself)(?: to| as)? ([a-z][a-z0-9 -]{0,23})",
+        text,
+    )
+    if name_match:
+        name = " ".join(part.capitalize() for part in name_match[1].split())
+        state["assistant_name"] = name
+        summary = f"Assistant name set to {name}."
+        return CommandResult(True, summary, spoken=summary, category="personality")
+
+    if re.match(r"(?:set |use )?(?:the )?personality\b", text) or re.match(
+        r"(?:set |rename )?(?:the )?(?:assistant name|yourself)\b", text,
+    ):
+        return CommandResult(
+            False,
+            "Try 'personality playful', 'personality status', or 'set assistant name Jarvis'.",
+            category="personality",
+        )
+    return None
+
+
+def local_clock() -> dict[str, str]:
+    """Read the system's local wall clock once for consistent time/date labels."""
+
+    now = datetime.now().astimezone()
+    hour = now.hour % 12 or 12
+    period = "AM" if now.hour < 12 else "PM"
+    return {
+        "time": f"{hour}:{now.minute:02d} {period}",
+        "clock": f"{hour}:{now.minute:02d}:{now.second:02d} {period}",
+        "date": f"{now:%B} {now.day}, {now.year}",
+        "day": f"{now:%A}",
+    }
+
+
+def clock_command(text: str) -> CommandResult | None:
+    """Match complete clock queries without consuming timer or light commands."""
+
+    query = text.replace("’", "'")
+    query = re.sub(r"\bwhat'?s\b", "what is", query)
+    query = re.sub(r"\btoday'?s\b", "today", query)
+    query = re.sub(r"^(?:(?:can|could) you )?(?:please )?", "", query)
+    query = re.sub(r",? please$", "", query)
+    queries = {
+        "time": {
+            "time", "time now", "current time", "what is the time", "what is the current time",
+            "what time is it", "what time is it now", "tell me the time", "tell me what time it is",
+        },
+        "date": {
+            "date", "today date", "current date", "what is the date", "what is today date",
+            "what is the date today", "what date is it", "what date is it today",
+            "tell me the date", "tell me today date",
+        },
+        "day": {
+            "day", "what day is it", "what day is today", "what day is it today",
+            "what is the day", "what is the day today", "what day of the week is it",
+            "tell me the day",
+        },
+    }
+    for field, phrases in queries.items():
+        if query in phrases:
+            value = local_clock()[field]
+            prefix = {"time": "The time is", "date": "Today's date is", "day": "Today is"}[field]
+            answer = f"{prefix} {value}."
+            return CommandResult(False, answer, spoken=answer, category="clock")
     return None
 
 
@@ -796,6 +974,9 @@ def apply_command(text: str, state: dict[str, Any]) -> CommandResult:
     feedback_result = feedback_command(command, state)
     if feedback_result is not None:
         return feedback_result
+    assistant_result = personality_command(command, state)
+    if assistant_result is not None:
+        return assistant_result
     if command in {"undo", "undo last command", "restore", "restore previous setting", "restore previous settings"}:
         history = state.get("_history", [])
         if not history:
@@ -838,11 +1019,25 @@ def _apply_command(text: str, state: dict[str, Any], *, allow_timer: bool = True
     if not raw:
         return CommandResult(False, "I didn't receive a command.")
 
+    clock_result = clock_command(normalized)
+    if clock_result is not None:
+        return clock_result
+
     if re.search(r"\bfeedback\b", normalized) or normalized.startswith("only announce"):
         return CommandResult(False, "Use feedback controls directly; they cannot be scheduled.")
 
+    if (
+        re.match(r"(?:set |use )?(?:the )?personality\b", normalized)
+        or re.match(r"(?:set |rename )?(?:the )?(?:assistant name|yourself)\b", normalized)
+        or normalized in {"assistant name", "show assistant name", "what is your name", "who are you"}
+    ):
+        return CommandResult(False, "Personality controls cannot be scheduled.")
+
     if normalized in {"quit", "exit", "stop", "goodbye", "shutdown"}:
         return CommandResult(False, "Shutting down gracefully.", should_exit=True)
+
+    if normalized in {"hud", "dashboard", "show hud", "show dashboard", "refresh hud"}:
+        return CommandResult(False, "Dashboard refreshed.")
 
     if normalized in {"help", "commands", "what can i say"}:
         return CommandResult(
@@ -852,7 +1047,9 @@ def _apply_command(text: str, state: dict[str, Any], *, allow_timer: bool = True
             "breathing blue, undo, restore previous setting, repeat last command, "
             "sleep in 30 minutes, turn off in 1 hour, or dim to 10% in 20 minutes. "
             "Enable spoken feedback, feedback volume 30, only announce alarms, mute feedback. "
-            "Type 'modes', 'effects', 'timer status', or 'feedback status' for details.",
+            "Ask 'what time is it', 'what is today's date', or 'what day is it'. "
+            "Try 'hud', 'personality playful', 'set assistant name Jarvis', 'modes', 'effects', "
+            "'timer status', or 'feedback status' for details.",
         )
 
     if normalized in {"modes", "scenes", "list modes", "list scenes"}:
@@ -1511,6 +1708,42 @@ def run_microphone_test() -> int:
     return 0
 
 
+def hud_snapshot(state: dict[str, Any]) -> dict[str, Any]:
+    """Return the small, thread-safe view consumed by the live terminal HUD."""
+
+    rgb = tuple(max(0, min(255, int(round(channel)))) for channel in target_rgb(state))
+    clock = local_clock()
+    mic = str(state.get("_mic_status", "STARTING")).upper()
+    phase = str(state.get("_mic_phase", "listening"))
+    waveforms = {
+        "listening": "▂▃▂▃▂▃",
+        "captured": "▂▅▇█▇▅",
+        "paused": "▁▁▁▁▁▁",
+        "offline": "× × × ×",
+    }
+    return {
+        "name": state.get("assistant_name", "Lumen"),
+        "connection": state.get("_connection", "SCANNING"),
+        "mic": mic,
+        "waveform": waveforms.get(phase, waveforms["listening"]),
+        "voice": LANGUAGE,
+        "speech": f"{str(state.get('feedback_mode', 'off')).upper()} · VOL {int(state.get('feedback_volume', DEFAULT_FEEDBACK_VOLUME))}%",
+        "feedback": f"{str(state.get('feedback_mode', 'off')).upper()} · {int(state.get('feedback_volume', DEFAULT_FEEDBACK_VOLUME))}%",
+        "personality": state.get("personality", "professional"),
+        "power": "ON" if state.get("on") else "OFF",
+        "color": light_color_label(state),
+        "scene": scene_label(state) or "manual",
+        "brightness": round(float(state.get("brightness", 0.0)) * 100),
+        "rgb": rgb,
+        "timer": timer_label(state) or "none",
+        "alarm": alarm_label(state) or "none",
+        "device": ADDRESS,
+        "language": LANGUAGE,
+        "clock": clock["clock"],
+        "calendar": f"{clock['day']} · {clock['date']}",
+    }
+
+
 async def event_worker(
     event_queue: asyncio.Queue,
     state: dict[str, Any],
@@ -1522,6 +1755,15 @@ async def event_worker(
         event = await event_queue.get()
         kind = event.get("kind") if isinstance(event, dict) else "command"
         if kind == "mic":
+            phase = event.get("phase", "listening")
+            state["_mic_phase"] = phase
+            state["_mic_status"] = {
+                "listening": "READY",
+                "captured": "CAPTURED",
+                "offline": "OFFLINE",
+                "paused": "PAUSED",
+            }.get(phase, "READY")
+            console.hud(state)
             if feedback and feedback.gate.token() is None and event.get("phase") == "listening":
                 console.mic_indicator("paused", "Spoken feedback playing…")
             else:
@@ -1544,13 +1786,20 @@ async def event_worker(
             console.status(result.summary, "success")
             shutdown.set()
             continue
-        console.light_state(state, result.summary)
+        if result.category == "clock":
+            console.status(personality_response(result.summary, state, result.category))
+        else:
+            console.light_state(state, result.summary)
+        if normalize_command(text) in {"hud", "dashboard", "show hud", "show dashboard", "refresh hud"}:
+            console.hud(state, force=True)
+        else:
+            console.hud(state)
         if feedback:
             if result.category == "feedback" and result.changed:
                 feedback.settings_changed()
             if normalize_command(text) == "feedback status":
                 console.status(feedback.engine_status())
-            feedback.say(result.spoken, result.category)
+            feedback.say(personality_response(result.spoken, state, result.category), result.category)
         if source == "voice":
             provider = event.get("provider", "online") if isinstance(event, dict) else "online"
             console.status(f"Recognized via {provider} speech input.", "success")
@@ -1569,13 +1818,16 @@ async def timer_worker(
             console.status(message, "success")
             console.light_state(state, "Timer action applied")
             if feedback:
-                feedback.say(f"Timer finished. {spoken_light_state(state)}", "timer")
+                feedback.say(personality_response(f"Timer finished. {spoken_light_state(state)}", state), "timer")
         alarm_message = apply_due_alarm(state)
         if alarm_message:
             console.status(alarm_message, "warning")
             console.light_state(state, "Visual alarm active")
             if feedback:
-                feedback.say("Your alarm is ringing. Say acknowledge alarm or snooze.", "alarm")
+                feedback.say(
+                    personality_response("Your alarm is ringing. Say acknowledge alarm or snooze.", state),
+                    "alarm",
+                )
         try:
             await asyncio.wait_for(shutdown.wait(), timeout=0.25)
         except asyncio.TimeoutError:
@@ -1597,8 +1849,6 @@ async def turn_off(client: BleakClient) -> None:
 
 
 async def run() -> None:
-    console = Console()
-    console.banner()
     state: dict[str, Any] = {
         "on": True,
         "color": COLORS["warm"],
@@ -1611,23 +1861,41 @@ async def run() -> None:
         "alarm": None,
         "feedback_mode": "off",
         "feedback_volume": DEFAULT_FEEDBACK_VOLUME,
+        "assistant_name": DEFAULT_ASSISTANT_NAME,
+        "personality": DEFAULT_PERSONALITY,
+        "_connection": "BOOTING",
+        "_mic_status": "STARTING",
+        "_mic_phase": "listening",
     }
-    console.light_state(state, "Starting up")
-    console.status("Spoken feedback is off. Say or type 'enable spoken feedback' to hear confirmations.")
 
     shutdown = asyncio.Event()
     loop = asyncio.get_running_loop()
+    event_queue: asyncio.Queue = asyncio.Queue()
+    dashboard: TerminalHUD | None = None
+
+    if sys.stdin.isatty() and sys.stdout.isatty() and not os.getenv("NO_HUD"):
+        dashboard = TerminalHUD(
+            lambda: hud_snapshot(state),
+            lambda text: post_event(loop, event_queue, {"kind": "command", "source": "keyboard", "text": text}),
+            shutdown,
+        )
+    console = Console(dashboard)
+    console.banner()
+    console.light_state(state, "Starting up")
+    console.hud(state, force=True)
+    console.status("Spoken feedback is off. Say or type 'enable spoken feedback' to hear confirmations.")
+
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, shutdown.set)
         except (NotImplementedError, RuntimeError):
             pass
 
-    event_queue: asyncio.Queue = asyncio.Queue()
     feedback = SpokenFeedback(state, console.status)
     feedback.start()
     worker = asyncio.create_task(event_worker(event_queue, state, shutdown, console, feedback))
     timer_task = asyncio.create_task(timer_worker(state, shutdown, console, feedback))
+    hud_task = asyncio.create_task(dashboard.run()) if dashboard else None
     mic_stop: Callable[..., Any] | None = None
     keyboard_stop: Callable[[], None] | None = None
     current: list[float] = [0.0, 0.0, 0.0]
@@ -1637,10 +1905,14 @@ async def run() -> None:
         # Run PortAudio calibration away from the asyncio loop so status events
         # and Bluetooth work stay responsive while the mic is being prepared.
         mic_stop = await asyncio.to_thread(start_listening, loop, event_queue, feedback.gate)
-        keyboard_stop = start_keyboard_input(loop, event_queue)
+        keyboard_stop = None if dashboard else start_keyboard_input(loop, event_queue)
+        state["_mic_status"] = "READY" if mic_stop is not None else "OFFLINE"
+        console.hud(state, force=True)
         console.prompt_help(mic_stop is not None)
 
         while not shutdown.is_set():
+            state["_connection"] = "SCANNING"
+            console.hud(state, force=True)
             console.status("Looking for the light over Bluetooth…", "info")
             try:
                 device = await BleakScanner.find_device_by_address(ADDRESS, timeout=10.0)
@@ -1650,14 +1922,18 @@ async def run() -> None:
                 continue
 
             if not device:
+                state["_connection"] = "SEARCHING"
                 console.status("Light not found. Make sure it is powered on; retrying in 5s.", "warning")
+                console.hud(state, force=True)
                 await wait_for_shutdown(shutdown, 5.0)
                 continue
 
             last_sent = None
             try:
                 async with BleakClient(device, timeout=20.0) as client:
+                    state["_connection"] = "CONNECTED"
                     console.status(f"Connected to {ADDRESS}", "success")
+                    console.hud(state, force=True)
                     while not shutdown.is_set():
                         target = target_rgb(state)
                         alarm = state.get("alarm") or {}
@@ -1680,7 +1956,9 @@ async def run() -> None:
                     await turn_off(client)
             except Exception as exc:
                 if not shutdown.is_set():
+                    state["_connection"] = "RECONNECTING"
                     console.status(f"Connection lost: {exc}. Reconnecting in 2s.", "warning")
+                    console.hud(state, force=True)
                     await wait_for_shutdown(shutdown, 2.0)
     except KeyboardInterrupt:
         shutdown.set()
@@ -1693,6 +1971,10 @@ async def run() -> None:
                 pass
         if keyboard_stop:
             keyboard_stop()
+        if dashboard:
+            dashboard.close()
+        if hud_task:
+            await asyncio.gather(hud_task, return_exceptions=True)
         worker.cancel()
         timer_task.cancel()
         await asyncio.gather(worker, timer_task, return_exceptions=True)

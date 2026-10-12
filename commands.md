@@ -327,6 +327,39 @@ Use `PIPER_MODEL=/path/to/voice.onnx python main.py` to select another downloade
 voice. `TTS_ENGINE=espeak python main.py` forces the fallback. These settings
 apply at startup; the voice's `.onnx.json` config must accompany its model.
 
+## Terminal HUD and personalities
+
+In an interactive terminal, Lumen uses a full-screen HUD with a live dashboard
+and a separate editable command field. The dashboard shows the Bluetooth and
+microphone state, speech settings, light state, timers, alarms, assistant name,
+and personality. Events remain available in the scrollable log.
+
+| Command or key | What it does |
+| --- | --- |
+| `hud` | Refresh the dashboard |
+| `dashboard` | Alias for `hud` |
+| `PageUp` / `PageDown` | Scroll the event log |
+| `Ctrl+L` | Jump to the newest event |
+| `Ctrl+C` | Shut down Lumen |
+
+Personality profiles change spoken confirmation style:
+
+```text
+personality professional
+personality minimal
+personality playful
+personality sarcastic
+personality cinematic
+personality jarvis
+personality status
+set assistant name Jarvis
+assistant name
+```
+
+`jarvis` and `dramatic` select the `cinematic` profile. Startup defaults can be
+set with `ASSISTANT_NAME` and `LUMEN_PERSONALITY`. Set `NO_HUD=1` to keep the
+legacy scrolling terminal interface.
+
 ## History and repeat
 
 Lumen keeps up to 20 successful light changes in memory while it is running.
@@ -342,6 +375,24 @@ again
 
 `undo` restores the previous light state. `repeat` runs the last successful
 light command again. History resets when the app exits.
+
+## Time, date, and day
+
+| Command | Answer |
+| --- | --- |
+| `what time is it`, `what is the time`, `what's the time`, `time` | Current local time, e.g. “The time is 9:42 PM.” |
+| `what is today's date`, `what's the date`, `date` | Current local date, e.g. “Today's date is October 10, 2026.” |
+| `what day is it`, `what day is today`, `day` | Current weekday, e.g. “Today is Saturday.” |
+
+`tell me the time`, `tell me the date`, and `tell me the day` also work.
+Queries use the computer's local timezone. The HUD shows a live `LOCAL` clock
+with seconds, the date, and the weekday. Answers follow the selected personality:
+minimal gives just the value; cinematic adds “At your service.”
+
+Use `enable spoken feedback` for spoken answers. Muted feedback, volume zero,
+and alarms-only mode show the answer in the terminal without speaking. Queries
+do not change the light, timers, alarms, or undo/repeat history. `time remaining`
+still reports the active timer's countdown.
 
 ## Information and help
 

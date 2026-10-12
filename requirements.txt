@@ -1,2 +1,3 @@
 bleak>=0.22,<2
 SpeechRecognition[audio]>=3.10.4,<4
+prompt_toolkit>=3.0.43,<4

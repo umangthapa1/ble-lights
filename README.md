@@ -16,6 +16,10 @@ reference.
   always know when audio was heard and exactly what was recognized.
 - Clear microphone, speech-service, Bluetooth, and recognition feedback.
 - Keyboard commands when you prefer typing or the microphone is unavailable.
+- A full-screen Jarvis-style terminal HUD with a live connection, microphone,
+  voice, light, timer, alarm, and assistant-status dashboard.
+- An editable command prompt with command history, scrollable event logs, and
+  `Ctrl+L` to jump back to the newest event.
 - Natural phrases such as `turn the light warm`, `make it brighter`, and
   `set brightness to 40%`.
 - Scene presets: sleep, night, relax, focus, reading, movie, and party.
@@ -28,6 +32,10 @@ reference.
 - Visual alarms with snooze, acknowledge, dismiss, and cancel controls.
 - Natural offline Piper voices with cached confirmations, adjustable volume,
   alarms-only mode, microphone echo suppression, and eSpeak fallback.
+- Personality profiles (`professional`, `minimal`, `playful`, `sarcastic`, and
+  `cinematic`) with configurable assistant naming.
+- Local time, date, and weekday queries with personality-aware replies and a
+  live clock/calendar in the HUD.
 - Smooth fades instead of abrupt color changes.
 - Automatic Bluetooth scanning and reconnecting.
 - `--list-mics` plus `MIC_DEVICE` support for choosing the correct input.
@@ -192,6 +200,9 @@ Available settings:
 | `SWAP_RB` | Swap red and blue channels | `false` |
 | `VOICE_LANGUAGE` | Speech recognition language | `en-US` |
 | `MIC_DEVICE` | Device index or name fragment | system default |
+| `ASSISTANT_NAME` | Name shown in the HUD and used by assistant queries | `Lumen` |
+| `LUMEN_PERSONALITY` | Starting response profile; `jarvis` aliases to `cinematic` | `professional` |
+| `NO_HUD` | Disable the full-screen HUD and use the scrolling terminal | unset |
 | `MIC_CALIBRATION_SECONDS` | Ambient-noise calibration length | `1` |
 | `MIC_PHRASE_LIMIT` | Maximum length of each phrase | `4` |
 | `MIC_TEST_SECONDS` | Duration of `--test-mic` | `2` |
@@ -225,6 +236,8 @@ Try saying or typing:
 - `undo`, `restore previous setting`, `repeat last command`, `timer status`
 - `alarm in 10 minutes`, `alarm status`, `snooze`, `acknowledge alarm`
 - `enable spoken feedback`, `feedback volume 30`, `only announce alarms`, `mute feedback`
+- `hud`, `dashboard`, `personality playful`, `set assistant name Jarvis`
+- `what time is it`, `what is today's date`, `what day is it`
 - `modes`, `effects`, `status`, `help`, `quit`
 
 ## Scene modes
@@ -338,5 +351,64 @@ wake me up
 
 `undo` restores the previous light state, while `repeat` replays the last
 successful command. History resets when the app exits.
+
+## Time, date, and day
+
+Ask or type:
+
+```text
+what time is it
+what's the time
+what is today's date
+what day is it
+time
+date
+day
+```
+
+Lumen uses your computer's local clock and timezone. Time is shown in 12-hour
+AM/PM format, dates include the month, day, and year, and day queries give the
+weekday. For example: “The time is 9:42 PM.”, “Today's date is October 10,
+2026.”, or “Today is Saturday.” The HUD's `LOCAL` row includes seconds and
+updates the date and weekday automatically at midnight.
+
+Answers appear in the terminal and use your selected personality. To hear them,
+use `enable spoken feedback`; muted, zero-volume, and alarms-only settings
+keep these answers silent. These queries work offline with typed input and
+Piper/eSpeak output; microphone transcription uses your configured recognizer.
+They leave light settings, timers, alarms, and undo/repeat history untouched.
+
+## Terminal HUD and personalities
+
+When Lumen runs in a terminal, it opens a full-screen dashboard. The header
+updates ten times per second and shows Bluetooth connection state, microphone
+activity, speech settings, light color and brightness, active timers, alarms,
+local time, date, weekday, assistant name, and personality. The bottom command
+field stays editable while the event log records recognition and connection
+messages.
+
+Use `PageUp`/`PageDown` to browse the event log, `Ctrl+L` to return to the latest
+entry, and `Ctrl+C` to shut down. Type `hud` or `dashboard` to refresh the
+dashboard after changing terminal dimensions. Set `NO_HUD=1` to use the
+scrolling terminal interface instead.
+
+Choose how confirmations sound during the current session:
+
+```text
+personality professional
+personality minimal
+personality playful
+personality sarcastic
+personality cinematic
+personality jarvis
+personality status
+set assistant name Jarvis
+what is your name
+```
+
+`professional` preserves Lumen's default confirmations. `minimal` trims common
+phrases, while the other profiles add a distinct response style. Personality
+settings apply to spoken confirmations and do not affect light undo/repeat
+history. Set `ASSISTANT_NAME` and `LUMEN_PERSONALITY` to choose startup defaults.
 
 Press `Ctrl+C` to stop. The light is turned off before Lumen exits.
