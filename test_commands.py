@@ -368,6 +368,27 @@ class CommandTests(unittest.TestCase):
                     self.assertEqual(snapshot["clock"], full_time)
                     self.assertEqual(snapshot["calendar"], f"{day} · {date}")
 
+    def test_listening_commands_change_only_microphone_state(self):
+        self.state["_listening_enabled"] = True
+        before = copy.deepcopy(self.state)
+
+        result = apply_command("stop listening", self.state)
+        self.assertTrue(result.changed)
+        self.assertEqual(result.category, "microphone")
+        self.assertFalse(self.state["_listening_enabled"])
+        self.assertEqual(light_snapshot_fields(self.state), light_snapshot_fields(before))
+
+        result = apply_command("pause listening", self.state)
+        self.assertFalse(result.changed)
+        self.assertIn("already paused", result.summary)
+
+        result = apply_command("resume listening", self.state)
+        self.assertTrue(result.changed)
+        self.assertTrue(self.state["_listening_enabled"])
+        self.assertEqual(result.spoken, "Microphone listening started.")
+        self.assertFalse(apply_command("stop listening in 5 minutes", self.state).changed)
+        self.assertIsNone(self.state.get("timer"))
+
 
 def light_snapshot_fields(state):
     return {key: state.get(key) for key in ("on", "color", "color_name", "brightness", "mode", "effect", "effect_color", "timer", "alarm")}

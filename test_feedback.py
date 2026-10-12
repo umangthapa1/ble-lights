@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import speech_recognition as sr
 
-from main import COLORS, apply_command, event_worker, light_snapshot, timer_worker
+from main import COLORS, MicrophoneController, apply_command, event_worker, light_snapshot, timer_worker
 from speech_feedback import FeedbackFilteredStream, PlaybackGate, PlaybackInterrupted, SpokenFeedback
 
 
@@ -169,6 +169,33 @@ class PlaybackGateTests(unittest.TestCase):
             self.assertTrue(audio.frame_data.startswith(speech * 2))
             self.assertTrue(gate.accepts(capture_token))
         native.close.assert_not_called()
+
+
+class MicrophoneControllerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_start_stop_and_restart_manage_the_listener_callback(self):
+        loop = asyncio.get_running_loop()
+        events = asyncio.Queue()
+        gate = PlaybackGate()
+        stops = []
+
+        def start_listener(*args):
+            stop = Mock()
+            stops.append(stop)
+            return stop
+
+        with patch("main.start_listening", side_effect=start_listener) as starter:
+            controller = MicrophoneController(loop, events, gate)
+            self.assertTrue(await controller.start())
+            self.assertTrue(controller.enabled)
+            self.assertTrue(await controller.start())
+            self.assertEqual(starter.call_count, 1)
+            self.assertTrue(await controller.stop())
+            self.assertFalse(controller.enabled)
+            stops[0].assert_called_once_with()
+            self.assertTrue(await controller.start())
+            self.assertEqual(starter.call_count, 2)
+            await controller.close()
+            stops[1].assert_called_once_with(False)
 
 
 class FakeProcess:

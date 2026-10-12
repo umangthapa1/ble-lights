@@ -36,6 +36,8 @@ reference.
   `cinematic`) with configurable assistant naming.
 - Local time, date, and weekday queries with personality-aware replies and a
   live clock/calendar in the HUD.
+- `start listening` and `stop listening` controls for pausing and resuming voice
+  input while keeping the typed HUD command prompt available.
 - Smooth fades instead of abrupt color changes.
 - Automatic Bluetooth scanning and reconnecting.
 - `--list-mics` plus `MIC_DEVICE` support for choosing the correct input.
@@ -238,6 +240,7 @@ Try saying or typing:
 - `enable spoken feedback`, `feedback volume 30`, `only announce alarms`, `mute feedback`
 - `hud`, `dashboard`, `personality playful`, `set assistant name Jarvis`
 - `what time is it`, `what is today's date`, `what day is it`
+- `start listening`, `stop listening`, `resume listening`, `pause listening`
 - `modes`, `effects`, `status`, `help`, `quit`
 
 ## Scene modes
@@ -377,6 +380,23 @@ use `enable spoken feedback`; muted, zero-volume, and alarms-only settings
 keep these answers silent. These queries work offline with typed input and
 Piper/eSpeak output; microphone transcription uses your configured recognizer.
 They leave light settings, timers, alarms, and undo/repeat history untouched.
+
+## Microphone listening controls
+
+Use these commands when you want to temporarily pause voice recognition:
+
+```text
+stop listening
+pause listening
+start listening
+resume listening
+```
+
+Stopping closes the active microphone stream and prevents voice commands from
+being captured. Starting listening reopens the selected device and recalibrates
+ambient noise. While listening is paused, the HUD's typed command field remains
+available, so `start listening` can be entered there to resume voice control.
+The HUD shows `READY`, `PAUSED`, or `OFFLINE` for the microphone state.
 
 ## Terminal HUD and personalities
 

@@ -553,6 +553,32 @@ def personality_command(text: str, state: dict[str, Any]) -> CommandResult | Non
     return None
 
 
+LISTEN_START_COMMANDS = {
+    "start listening", "resume listening", "start microphone", "enable microphone",
+    "unmute microphone", "listen for commands",
+}
+LISTEN_STOP_COMMANDS = {
+    "stop listening", "pause listening", "stop microphone", "disable microphone",
+    "mute microphone", "stop listening for commands",
+}
+
+
+def listening_command(text: str, state: dict[str, Any]) -> CommandResult | None:
+    """Handle microphone listening controls outside light history."""
+
+    if text in LISTEN_START_COMMANDS:
+        already_enabled = state.get("_listening_enabled", True)
+        state["_listening_enabled"] = True
+        summary = "Microphone is already listening." if already_enabled else "Microphone listening started."
+        return CommandResult(not already_enabled, summary, spoken=summary, category="microphone")
+    if text in LISTEN_STOP_COMMANDS:
+        already_disabled = not state.get("_listening_enabled", True)
+        state["_listening_enabled"] = False
+        summary = "Microphone is already paused." if already_disabled else "Microphone listening stopped."
+        return CommandResult(not already_disabled, summary, spoken=summary, category="microphone")
+    return None
+
+
 def local_clock() -> dict[str, str]:
     """Read the system's local wall clock once for consistent time/date labels."""
 
@@ -977,6 +1003,9 @@ def apply_command(text: str, state: dict[str, Any]) -> CommandResult:
     assistant_result = personality_command(command, state)
     if assistant_result is not None:
         return assistant_result
+    listening_result = listening_command(command, state)
+    if listening_result is not None:
+        return listening_result
     if command in {"undo", "undo last command", "restore", "restore previous setting", "restore previous settings"}:
         history = state.get("_history", [])
         if not history:
@@ -1026,6 +1055,9 @@ def _apply_command(text: str, state: dict[str, Any], *, allow_timer: bool = True
     if re.search(r"\bfeedback\b", normalized) or normalized.startswith("only announce"):
         return CommandResult(False, "Use feedback controls directly; they cannot be scheduled.")
 
+    if normalized in LISTEN_START_COMMANDS | LISTEN_STOP_COMMANDS:
+        return CommandResult(False, "Microphone controls cannot be scheduled.")
+
     if (
         re.match(r"(?:set |use )?(?:the )?personality\b", normalized)
         or re.match(r"(?:set |rename )?(?:the )?(?:assistant name|yourself)\b", normalized)
@@ -1048,6 +1080,7 @@ def _apply_command(text: str, state: dict[str, Any], *, allow_timer: bool = True
             "sleep in 30 minutes, turn off in 1 hour, or dim to 10% in 20 minutes. "
             "Enable spoken feedback, feedback volume 30, only announce alarms, mute feedback. "
             "Ask 'what time is it', 'what is today's date', or 'what day is it'. "
+            "Use 'start listening' or 'stop listening' to control the microphone. "
             "Try 'hud', 'personality playful', 'set assistant name Jarvis', 'modes', 'effects', "
             "'timer status', or 'feedback status' for details.",
         )
@@ -1628,6 +1661,54 @@ def start_listening(
     return stop
 
 
+class MicrophoneController:
+    """Start and stop the microphone listener without blocking the event loop."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, event_queue: asyncio.Queue,
+                 playback_gate: PlaybackGate | None = None) -> None:
+        self.loop = loop
+        self.event_queue = event_queue
+        self.playback_gate = playback_gate
+        self.stop_callback: Callable[..., Any] | None = None
+        self.enabled = False
+        self._lock = asyncio.Lock()
+
+    async def start(self) -> bool:
+        async with self._lock:
+            if self.enabled:
+                return True
+            stop_callback = await asyncio.to_thread(
+                start_listening, self.loop, self.event_queue, self.playback_gate,
+            )
+            if stop_callback is None:
+                self.stop_callback = None
+                self.enabled = False
+                return False
+            self.stop_callback = stop_callback
+            self.enabled = True
+            return True
+
+    async def stop(self) -> bool:
+        async with self._lock:
+            if not self.enabled or self.stop_callback is None:
+                self.enabled = False
+                self.stop_callback = None
+                return True
+            stop_callback, self.stop_callback = self.stop_callback, None
+            self.enabled = False
+            await asyncio.to_thread(stop_callback)
+            return True
+
+    async def close(self) -> None:
+        async with self._lock:
+            if self.stop_callback is None:
+                self.enabled = False
+                return
+            stop_callback, self.stop_callback = self.stop_callback, None
+            self.enabled = False
+            await asyncio.to_thread(stop_callback, False)
+
+
 def start_keyboard_input(
     loop: asyncio.AbstractEventLoop,
     event_queue: asyncio.Queue,
@@ -1750,6 +1831,7 @@ async def event_worker(
     shutdown: asyncio.Event,
     console: Console,
     feedback: SpokenFeedback | None = None,
+    microphone: MicrophoneController | None = None,
 ) -> None:
     while not shutdown.is_set():
         event = await event_queue.get()
@@ -1786,7 +1868,17 @@ async def event_worker(
             console.status(result.summary, "success")
             shutdown.set()
             continue
-        if result.category == "clock":
+        if result.category == "microphone" and microphone:
+            requested = state.get("_listening_enabled", True)
+            ready = await microphone.start() if requested else await microphone.stop()
+            state["_listening_enabled"] = microphone.enabled if requested else False
+            if requested and not ready:
+                result.changed = False
+                result.summary = "Microphone could not start; check the microphone status."
+                result.spoken = result.summary
+            state["_mic_status"] = "READY" if microphone.enabled else "PAUSED"
+            state["_mic_phase"] = "listening" if microphone.enabled else "paused"
+        if result.category in {"clock", "microphone"}:
             console.status(personality_response(result.summary, state, result.category))
         else:
             console.light_state(state, result.summary)
@@ -1803,7 +1895,10 @@ async def event_worker(
         if source == "voice":
             provider = event.get("provider", "online") if isinstance(event, dict) else "online"
             console.status(f"Recognized via {provider} speech input.", "success")
-            console.mic_indicator("listening", "Waiting for your next command…")
+            if microphone and not microphone.enabled:
+                console.mic_indicator("paused", "Listening paused. Type `start listening` to resume.")
+            else:
+                console.mic_indicator("listening", "Waiting for your next command…")
 
 
 async def timer_worker(
@@ -1866,6 +1961,7 @@ async def run() -> None:
         "_connection": "BOOTING",
         "_mic_status": "STARTING",
         "_mic_phase": "listening",
+        "_listening_enabled": True,
     }
 
     shutdown = asyncio.Event()
@@ -1893,10 +1989,10 @@ async def run() -> None:
 
     feedback = SpokenFeedback(state, console.status)
     feedback.start()
-    worker = asyncio.create_task(event_worker(event_queue, state, shutdown, console, feedback))
+    microphone = MicrophoneController(loop, event_queue, feedback.gate)
+    worker = asyncio.create_task(event_worker(event_queue, state, shutdown, console, feedback, microphone))
     timer_task = asyncio.create_task(timer_worker(state, shutdown, console, feedback))
     hud_task = asyncio.create_task(dashboard.run()) if dashboard else None
-    mic_stop: Callable[..., Any] | None = None
     keyboard_stop: Callable[[], None] | None = None
     current: list[float] = [0.0, 0.0, 0.0]
     last_sent: tuple[int, int, int] | None = None
@@ -1904,11 +2000,12 @@ async def run() -> None:
     try:
         # Run PortAudio calibration away from the asyncio loop so status events
         # and Bluetooth work stay responsive while the mic is being prepared.
-        mic_stop = await asyncio.to_thread(start_listening, loop, event_queue, feedback.gate)
+        mic_started = await microphone.start()
         keyboard_stop = None if dashboard else start_keyboard_input(loop, event_queue)
-        state["_mic_status"] = "READY" if mic_stop is not None else "OFFLINE"
+        state["_listening_enabled"] = mic_started
+        state["_mic_status"] = "READY" if mic_started else "OFFLINE"
         console.hud(state, force=True)
-        console.prompt_help(mic_stop is not None)
+        console.prompt_help(mic_started)
 
         while not shutdown.is_set():
             state["_connection"] = "SCANNING"
@@ -1964,11 +2061,10 @@ async def run() -> None:
         shutdown.set()
     finally:
         shutdown.set()
-        if mic_stop:
-            try:
-                mic_stop(wait_for_stop=False)
-            except Exception:
-                pass
+        try:
+            await microphone.close()
+        except Exception:
+            pass
         if keyboard_stop:
             keyboard_stop()
         if dashboard:

@@ -394,6 +394,20 @@ and alarms-only mode show the answer in the terminal without speaking. Queries
 do not change the light, timers, alarms, or undo/repeat history. `time remaining`
 still reports the active timer's countdown.
 
+## Microphone listening controls
+
+| Command | What it does |
+| --- | --- |
+| `stop listening` | Close the microphone stream and pause voice recognition |
+| `pause listening` | Alias for `stop listening` |
+| `start listening` | Reopen and recalibrate the microphone |
+| `resume listening` | Alias for `start listening` |
+
+Additional aliases include `start microphone`, `stop microphone`, `enable
+microphone`, and `disable microphone`. When voice input is paused, enter
+`start listening` in the HUD's typed command field. The microphone indicator
+shows `READY`, `PAUSED`, or `OFFLINE`.
+
 ## Information and help
 
 ```text
