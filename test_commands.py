@@ -20,6 +20,8 @@ from main import (
     local_clock,
     personality_response,
     recognize_standby_audio,
+    recognize_active_audio,
+    is_recoverable_microphone_error,
     scene_label,
     target_rgb,
     timer_label,
@@ -424,6 +426,28 @@ class CommandTests(unittest.TestCase):
                 recognize_standby_audio(recognizer, audio),
                 ("hey lumen turn the lights off", "offline wake phrase"),
             )
+
+    def test_active_recognition_recovers_from_provider_timeout(self):
+        audio = Mock()
+        cleaned_audio = Mock()
+        recognizer = Mock()
+        recognizer.recognize_google.side_effect = [TimeoutError("timed out"), "blue"]
+        recognizer.recognize_sphinx.return_value = "blue"
+        self.assertEqual(
+            recognize_active_audio(recognizer, audio, cleaned_audio),
+            ("blue", "offline"),
+        )
+        self.assertEqual(recognizer.recognize_google.call_count, 1)
+
+        recognizer.reset_mock()
+        recognizer.recognize_google.side_effect = [sr.UnknownValueError(), TimeoutError("timed out")]
+        self.assertIsNone(recognize_active_audio(recognizer, audio, cleaned_audio))
+        self.assertEqual(recognizer.recognize_google.call_count, 2)
+
+    def test_microphone_read_timeouts_and_overflows_are_recoverable(self):
+        self.assertTrue(is_recoverable_microphone_error(TimeoutError("timed out")))
+        self.assertTrue(is_recoverable_microphone_error(OSError("input overflowed")))
+        self.assertFalse(is_recoverable_microphone_error(RuntimeError("broken parser")))
 
 
 def light_snapshot_fields(state):

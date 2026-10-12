@@ -910,11 +910,9 @@ def recognize_standby_audio(
             return None
         try:
             return recognizer.recognize_google(cleaned_audio, language=LANGUAGE), "online normalized wake phrase"
-        except sr.UnknownValueError:
+        except (sr.UnknownValueError, sr.RequestError, TimeoutError):
             return None
-        except sr.RequestError:
-            pass
-    except sr.RequestError:
+    except (sr.RequestError, TimeoutError):
         pass
     except Exception:
         return None
@@ -924,6 +922,28 @@ def recognize_standby_audio(
     except Exception:
         return None
 
+
+def recognize_active_audio(
+    recognizer: sr.Recognizer, audio: sr.AudioData, cleaned_audio: sr.AudioData,
+) -> tuple[str, str] | None:
+    """Recognize a normal command without allowing provider timeouts to kill listening."""
+
+    try:
+        return recognizer.recognize_google(audio, language=LANGUAGE), "online"
+    except sr.UnknownValueError:
+        if cleaned_audio is audio:
+            return None
+        try:
+            return recognizer.recognize_google(cleaned_audio, language=LANGUAGE), "online normalized fallback"
+        except (sr.UnknownValueError, sr.RequestError, TimeoutError):
+            return None
+    except (sr.RequestError, TimeoutError):
+        try:
+            return recognizer.recognize_sphinx(cleaned_audio, language=LANGUAGE), "offline"
+        except Exception:
+            return None
+    except Exception:
+        return None
 
 def target_rgb(state: dict[str, Any], now: float | None = None) -> tuple[float, float, float]:
     current = time.monotonic() if now is None else now
@@ -1535,6 +1555,12 @@ def wake_command(text: str) -> str | None:
     return normalize_command(match.group(1).strip() or "start listening")
 
 
+def is_recoverable_microphone_error(error: BaseException) -> bool:
+    """Identify stream hiccups that should not terminate the listener thread."""
+
+    return isinstance(error, (TimeoutError, OSError))
+
+
 def start_listening(
     loop: asyncio.AbstractEventLoop,
     event_queue: asyncio.Queue,
@@ -1600,47 +1626,17 @@ def start_listening(
             event_queue,
             {"kind": "mic", "phase": "captured", "message": level_detail},
         )
-        try:
-            # Keep the original path first for compatibility with the version
-            # that was already recognizing commands reliably. The centered and
-            # normalized audio is a fallback for noisy/default ALSA routes.
-            text = recognizer_instance.recognize_google(audio, language=LANGUAGE)
-            provider = "online"
-        except sr.UnknownValueError:
-            if cleaned_audio is not audio:
-                try:
-                    text = recognizer_instance.recognize_google(cleaned_audio, language=LANGUAGE)
-                    provider = "online normalized fallback"
-                except sr.UnknownValueError:
-                    post_event(loop, event_queue, {"kind": "status", "level": "info", "message": "I heard something, but couldn't make out the words."})
-                    post_event(loop, event_queue, {"kind": "mic", "phase": "listening", "message": "Listening again…"})
-                    return
-                except sr.RequestError as google_error:
-                    post_event(loop, event_queue, {"kind": "status", "level": "warning", "message": f"Speech service unavailable ({google_error}). Check internet or install optional PocketSphinx."})
-                    post_event(loop, event_queue, {"kind": "mic", "phase": "offline", "message": "Waiting for your next command…"})
-                    return
-            else:
-                post_event(loop, event_queue, {"kind": "status", "level": "info", "message": "I heard something, but couldn't make out the words."})
-                post_event(loop, event_queue, {"kind": "mic", "phase": "listening", "message": "Listening again…"})
-                return
-        except sr.RequestError as google_error:
-            # If the optional PocketSphinx package is installed, voice control
-            # keeps working without internet. Otherwise give a useful action.
-            try:
-                text = recognizer_instance.recognize_sphinx(cleaned_audio, language=LANGUAGE)
-                provider = "offline"
-            except Exception:
-                post_event(
-                    loop,
-                    event_queue,
-                    {"kind": "status", "level": "warning", "message": f"Speech service unavailable ({google_error}). Check internet or install optional PocketSphinx."},
-                )
-                post_event(loop, event_queue, {"kind": "mic", "phase": "offline", "message": "Waiting for your next command…"})
-                return
-        except Exception as exc:
-            post_event(loop, event_queue, {"kind": "status", "level": "warning", "message": f"Voice recognition error: {exc}"})
-            post_event(loop, event_queue, {"kind": "mic", "phase": "listening", "message": "Listening again…"})
+        recognized = recognize_active_audio(recognizer_instance, audio, cleaned_audio)
+        if recognized is None:
+            post_event(loop, event_queue, {
+                "kind": "status", "level": "info",
+                "message": "I couldn't transcribe that phrase; listening again.",
+            })
+            post_event(loop, event_queue, {
+                "kind": "mic", "phase": "listening", "message": "Listening again…",
+            })
             return
+        text, provider = recognized
 
         if playback_gate and not playback_gate.accepts(capture_token):
             return
@@ -1692,6 +1688,7 @@ def start_listening(
                 post_event(loop, event_queue, {"kind": "mic", "phase": "listening", "message": "Waiting for your voice…"})
                 idle_windows = 0
                 was_paused = False
+                last_stream_notice = 0.0
                 while running.is_set():
                     mode = listening_mode.get()
                     if mode == ListeningMode.OFF:
@@ -1729,6 +1726,17 @@ def start_listening(
                                 event_queue,
                                 {"kind": "mic", "phase": "listening", "message": f"Still listening… no voice detected above level {recognizer.energy_threshold:.0f}."},
                             )
+                        continue
+                    except Exception as exc:
+                        if not is_recoverable_microphone_error(exc):
+                            raise
+                        now = time.monotonic()
+                        if now - last_stream_notice >= 5.0:
+                            post_event(loop, event_queue, {
+                                "kind": "status", "level": "warning",
+                                "message": f"Microphone read hiccup ({exc}); continuing to listen.",
+                            })
+                            last_stream_notice = now
                         continue
                     idle_windows = 0
                     if running.is_set() and (not playback_gate or playback_gate.accepts(capture_token)):
